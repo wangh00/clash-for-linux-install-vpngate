@@ -15,7 +15,7 @@
 
 ---
 
-本项目基于 `clash-for-linux-install` 二次开发，使用 Mihomo 原生 OpenVPN
+本项目基于 [`clash-for-linux-install`](https://github.com/nelvko/clash-for-linux-install) 二次开发，使用 Mihomo 原生 OpenVPN
 出站。前置订阅负责访问 VPNGate API，以及连接部分无法直连的中继服务器。
 
 | 功能 | 说明 |
