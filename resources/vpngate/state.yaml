@@ -1,0 +1,15 @@
+enabled: false
+front-group: ""
+country: ""
+limit: 0
+updated-at: ""
+node-count: 0
+checked-at: ""
+last-update-result: ""
+last-update-error: ""
+last-apply-method: ""
+auto-update-enabled: false
+auto-update-interval: 60
+last-auto-check: ""
+last-auto-result: ""
+last-auto-error: ""

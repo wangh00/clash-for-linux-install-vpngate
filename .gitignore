@@ -1,0 +1,49 @@
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本机安装参数覆盖，可存放订阅 URL、代理密码等敏感值
+/.env
+.env.local
+.env.install.local
+.env.*.local
+*.local.env
+
+# 安装或调试过程中生成的运行文件
+bin/
+resources/dist/
+config.yaml*
+runtime.yaml
+temp.yaml
+last-failed.*
+*.log
+*.pid
+*.lock
+*.tmp
+*.part
+*.bak
+*.bak.*
+
+# 本机订阅与 VPNGate 运行缓存
+resources/profiles/*.yaml
+!resources/profiles/.gitkeep
+resources/vpngate/servers.csv
+resources/vpngate/scheduled-update.sh
+resources/vpngate/.build.*/
+resources/vpngate/.static.*/
+resources/vpngate/.update-backup.*/
+resources/vpngate/.servers.*.csv
+
+# 本地部署、备份和临时测试目录
+.deploy-*/
+vpngate-backup-*/
+test.sh
+
+# 只提交内置 Zashboard，安装时下载的其他压缩包不上传
+archives/*
+!archives/dist.zip
+
+!.gitkeep
