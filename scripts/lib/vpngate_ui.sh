@@ -17,7 +17,7 @@ _vpngate_patch_zashboard() {
 
     cat >"$script" <<'JS'
 ;(() => {
-  const patchVersion = '2026.09.02.2'
+  const patchVersion = '2026.09.03.3'
   const checkStorageKey = 'clashctl/vpngate-ui-check'
   const routeSelector = 'VPNGate-AUTO'
   const smartAuto = 'VPNGate-\u667a\u80fd\u81ea\u52a8'
@@ -115,6 +115,13 @@ _vpngate_patch_zashboard() {
 
   const groupNameOf = (title) => [...groups.keys()].find((name) =>
     title?.innerText?.trimStart()?.startsWith(name))
+
+  // Zashboard 2.x 显示“Selector”，3.25.x 改成了全大写“SELECTOR”。
+  // 以 Controller 返回的组类型为主、DOM 文本为兼容兜底，避免再次把纯
+  // 样式/大小写变化误判成不支持测速的组。
+  const isSelectorType = (value) => String(value || '').toLowerCase().includes('selector')
+  const isSelectorGroup = (group, title) =>
+    isSelectorType(lastProxies?.[group]?.type) || isSelectorType(title?.innerText)
 
   const resolveLeaf = (proxies, start) => {
     let current = start || ''
@@ -219,6 +226,8 @@ _vpngate_patch_zashboard() {
     }
     names.filter((name) => !proxies[name]).forEach((name) =>
       errors.push(`Mihomo 缺少策略组 ${name}`))
+    present.filter((name) => !isSelectorType(proxies[name]?.type)).forEach((name) =>
+      errors.push(`${name} 类型不是 Selector`))
     if (!proxies[routeSelector]) errors.push(`Mihomo 缺少顶层出口选择器 ${routeSelector}`)
     if (!proxies[smartAuto]) errors.push(`Mihomo 缺少智能自动组 ${smartAuto}`)
 
@@ -235,6 +244,9 @@ _vpngate_patch_zashboard() {
         }
         if (collapse && !collapse.querySelector(':scope > .collapse-title .latency-tag')) {
           domErrors.push(`${name} 标题缺少 .latency-tag`)
+        }
+        if (collapse && !isSelectorGroup(name, collapse.querySelector(':scope > .collapse-title'))) {
+          domErrors.push(`${name} 无法识别 Selector 类型`)
         }
       })
       if (domErrors.length) {
@@ -328,7 +340,7 @@ _vpngate_patch_zashboard() {
       }, 250)
       return
     }
-    if (!tag || !groups.has(group) || !title.innerText.includes('Selector')) return
+    if (!tag || !groups.has(group) || !isSelectorGroup(group, title)) return
 
     const card = tag.closest('.cursor-pointer')
     const node = card?.innerText?.split('\n')?.[0]?.trim()
@@ -353,9 +365,7 @@ _vpngate_patch_zashboard() {
     }
 
     running = true
-    const original = tag.innerHTML
     const timeout = groups.get(group)
-    tag.textContent = '测速中'
     toast(isGroupTest
       ? `${group} 全体测速中，最长等待 ${timeout / 1000} 秒…`
       : `${node} 单节点测速中，最长等待 ${timeout / 1000} 秒…`)
@@ -379,21 +389,18 @@ _vpngate_patch_zashboard() {
       if (!response.ok) throw new Error(data.message || `HTTP ${response.status}`)
       if (isGroupTest) {
         const count = Object.values(data).filter((value) => Number.isFinite(value)).length
-        tag.textContent = String(count)
         toast(`${group} 全体测速完成：${count} 个节点返回延迟。`)
         setTimeout(() => location.reload(), 1200)
       } else {
         const delay = Number(data.delay)
         if (!Number.isFinite(delay) || delay <= 0) throw new Error('未返回有效延迟')
-        tag.textContent = String(delay)
         toast(`${node} 单节点测速完成：${delay} ms。`)
-        setTimeout(() => {
-          const el = document.getElementById('vpngate-group-test-toast')
-          if (el) el.hidden = true
-        }, 1800)
+        // 不直接改写 Vue 管理的 latency-tag 子节点，避免 Zashboard 3.25
+        // 在下一次虚拟 DOM 更新时触发 insertBefore(null)。刷新后面板会从
+        // Mihomo 的 history 读取并显示本次真实延迟。
+        setTimeout(() => location.reload(), 1200)
       }
     } catch (error) {
-      tag.innerHTML = original
       toast(`${isGroupTest ? group + ' 全体' : node + ' 单节点'}测速失败：${error.message || error}`, true)
     } finally {
       clearTimeout(timer)
@@ -440,10 +447,11 @@ _vpngate_ui_static_check() {
 
     [ -s "$index" ] && [ -s "$script" ] || return 1
     grep -q 'id="vpngate-disable-single-test"' "$index" || return 1
-    grep -q "const patchVersion = '2026.09.02.2'" "$script" || return 1
+    grep -q "const patchVersion = '2026.09.03.3'" "$script" || return 1
     grep -q "checkStorageKey = 'clashctl/vpngate-ui-check'" "$script" || return 1
     grep -q "querySelectorAll('.collapse')" "$script" || return 1
     grep -q "'.latency-tag'" "$script" || return 1
+    grep -q 'const isSelectorGroup' "$script" || return 1
 
     expected=$(sha256sum "$script" | awk '{print substr($1,1,12)}')
     actual=$(grep -oE 'vpngate-ui\.js\?v=[0-9a-f]+' "$index" | head -1 | cut -d= -f2)
@@ -470,7 +478,7 @@ _vpngate_ui_check() {
     fi
 
     if [ -s "$script" ]; then
-        printf '  [OK] 浏览器运行时自检已内置（版本 2026.09.02.2）\n'
+        printf '  [OK] 浏览器运行时自检已内置（版本 2026.09.03.3）\n'
         printf '       结果键：localStorage["clashctl/vpngate-ui-check"]\n'
     fi
 

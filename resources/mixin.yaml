@@ -2,7 +2,9 @@ mixed-port: 7890
 
 external-controller: "0.0.0.0:9090"
 external-ui: dist
-external-ui-url: https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip
+# VPNGate UI 补丁已针对该版本完成浏览器回归测试；升级版本前应重新执行
+# clashctl vpngate ui-check 和全体/单节点测速测试，避免自动追踪 latest 后失配。
+external-ui-url: https://github.com/Zephyruso/zashboard/releases/download/v3.25.0/dist.zip
 secret:
 
 allow-lan: false # 若开启务必设置身份验证以防暴露公网后被滥用
