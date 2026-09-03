@@ -42,37 +42,41 @@
 
 > 推荐使用 **Debian/Ubuntu**，并确保系统支持 `/dev/net/tun`。
 
-进入项目目录：
+### 一键安装（推荐）
+
+直接复制下面整段命令执行，无需提前修改端口或其他配置：
 
 ```bash
-cd clash-for-linux-install-vpngate
+git clone --branch main --depth 1 https://gh-proxy.com/https://github.com/wangh00/clash-for-linux-install-vpngate.git \
+  && cd clash-for-linux-install-vpngate \
+  && bash install.sh
 ```
 
-安装前建议复制一份不会被 Git 上传的本机配置：
+如果 `gh-proxy.com` 无法使用，可以改用备用镜像：
+
+```bash
+git clone --branch main --depth 1 https://ghfast.top/https://github.com/wangh00/clash-for-linux-install-vpngate.git \
+  && cd clash-for-linux-install-vpngate \
+  && bash install.sh
+```
+
+默认安装配置：
+
+- 内核：Mihomo；
+- 安装目录：`~/clashctl`；
+- 局域网 HTTP/SOCKS5 共用端口：`7890`；
+- 监听地址：`0.0.0.0`；
+- 代理用户名：`vpngate`；
+- 代理密码：安装时随机生成；
+- 初始订阅：留空，安装后从 `clashctl` 控制中心添加。
+
+### 可选：安装前自定义
+
+只有需要修改端口、账号或安装时自动导入订阅时，才需要执行：
 
 ```bash
 cp .env.install .env.install.local
 nano .env.install.local
-```
-
-通常只需要按需修改以下内容：
-
-```bash
-# 可选：安装时自动导入的前置订阅；留空则安装后从控制中心添加
-CLASHCTL_SUB_URL=
-
-# 局域网 HTTP/SOCKS5 共用端口
-CLASHCTL_MIXED_PORT=7890
-CLASHCTL_LAN_BIND_ADDRESS=0.0.0.0
-
-# 局域网代理账号；密码留空会自动生成
-CLASHCTL_PROXY_USERNAME=vpngate
-CLASHCTL_PROXY_PASSWORD=
-```
-
-执行安装：
-
-```bash
 bash install.sh
 ```
 
@@ -95,7 +99,7 @@ clashctl
 
 ## 二、导入前置订阅
 
-如果已经在 `.env.install` 中填写了 `CLASHCTL_SUB_URL`，安装时会自动导入，
+如果已经在 `.env.install.local` 中填写了 `CLASHCTL_SUB_URL`，安装时会自动导入，
 可以跳过本节。
 
 否则进入控制中心：
