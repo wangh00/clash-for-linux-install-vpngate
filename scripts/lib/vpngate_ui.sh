@@ -17,7 +17,7 @@ _vpngate_patch_zashboard() {
 
     cat >"$script" <<'JS'
 ;(() => {
-  const patchVersion = '2026.09.03.3'
+  const patchVersion = '2026.09.04.1'
   const checkStorageKey = 'clashctl/vpngate-ui-check'
   const routeSelector = 'VPNGate-AUTO'
   const smartAuto = 'VPNGate-\u667a\u80fd\u81ea\u52a8'
@@ -31,6 +31,7 @@ _vpngate_patch_zashboard() {
   let compatibilityErrorShown = false
   let apiFailureSince = 0
   let domFailureSince = 0
+  const latencyResults = new Map()
 
   const controller = () => {
     try {
@@ -71,6 +72,59 @@ _vpngate_patch_zashboard() {
     el.textContent = message
     el.hidden = false
     return el
+  }
+
+  // Zashboard 3.25 的延迟标签由 Vue 管理。直接替换 textContent/innerHTML
+  // 会破坏虚拟 DOM 的锚点；这里仅设置 data 属性，再用伪元素把结果显示在
+  // 原来的 40x20 延迟框里，不触碰 Vue 创建的任何子节点。
+  const latencyStyle = document.createElement('style')
+  latencyStyle.id = 'vpngate-latency-overlay-style'
+  latencyStyle.textContent = `
+    .latency-tag[data-vpngate-delay] { position: relative !important; }
+    .latency-tag[data-vpngate-delay] > * { visibility: hidden !important; }
+    .latency-tag[data-vpngate-delay]::after {
+      content: attr(data-vpngate-delay);
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      font-size: 12px;
+      line-height: 16px;
+      font-variant-numeric: tabular-nums;
+      color: currentColor;
+      pointer-events: none;
+    }
+  `
+  document.head.appendChild(latencyStyle)
+
+  const renderLatencyResults = () => {
+    document.querySelectorAll('.collapse-content .cursor-pointer').forEach((card) => {
+      const name = card.innerText?.split('\n')?.[0]?.trim()
+      const tag = card.querySelector('.latency-tag')
+      if (!tag) return
+      const value = latencyResults.get(name)
+      if (value === undefined) {
+        const ownedTitle = tag.dataset.vpngateDelayTitle
+        if (ownedTitle && tag.getAttribute('title') === ownedTitle) tag.removeAttribute('title')
+        tag.removeAttribute('data-vpngate-delay')
+        tag.removeAttribute('data-vpngate-delay-title')
+        return
+      }
+      tag.dataset.vpngateDelay = value
+      tag.dataset.vpngateDelayTitle = value === '…' ? 'VPNGate 节点测速中' : `VPNGate 延迟 ${value} ms`
+      tag.title = tag.dataset.vpngateDelayTitle
+    })
+  }
+
+  const setLatencyResult = (node, value) => {
+    latencyResults.set(node, String(value))
+    renderLatencyResults()
+  }
+
+  const restoreLatencyResult = (node, previous) => {
+    if (previous === undefined) latencyResults.delete(node)
+    else latencyResults.set(node, previous)
+    renderLatencyResults()
   }
 
   const saveCompatibility = (status, errors = [], detail = '') => {
@@ -366,6 +420,8 @@ _vpngate_patch_zashboard() {
 
     running = true
     const timeout = groups.get(group)
+    const previousResult = isNodeTest ? latencyResults.get(node) : undefined
+    if (isNodeTest) setLatencyResult(node, '…')
     toast(isGroupTest
       ? `${group} 全体测速中，最长等待 ${timeout / 1000} 秒…`
       : `${node} 单节点测速中，最长等待 ${timeout / 1000} 秒…`)
@@ -394,13 +450,15 @@ _vpngate_patch_zashboard() {
       } else {
         const delay = Number(data.delay)
         if (!Number.isFinite(delay) || delay <= 0) throw new Error('未返回有效延迟')
+        setLatencyResult(node, delay)
         toast(`${node} 单节点测速完成：${delay} ms。`)
-        // 不直接改写 Vue 管理的 latency-tag 子节点，避免 Zashboard 3.25
-        // 在下一次虚拟 DOM 更新时触发 insertBefore(null)。刷新后面板会从
-        // Mihomo 的 history 读取并显示本次真实延迟。
-        setTimeout(() => location.reload(), 1200)
+        setTimeout(() => {
+          const el = document.getElementById('vpngate-group-test-toast')
+          if (el) el.hidden = true
+        }, 1800)
       }
     } catch (error) {
+      if (isNodeTest) restoreLatencyResult(node, previousResult)
       toast(`${isGroupTest ? group + ' 全体' : node + ' 单节点'}测速失败：${error.message || error}`, true)
     } finally {
       clearTimeout(timer)
@@ -410,6 +468,7 @@ _vpngate_patch_zashboard() {
 
   new MutationObserver(() => {
     renderActiveRoute()
+    renderLatencyResults()
     checkCompatibility()
   }).observe(document.getElementById('app') || document.body, {
     childList: true,
@@ -447,11 +506,12 @@ _vpngate_ui_static_check() {
 
     [ -s "$index" ] && [ -s "$script" ] || return 1
     grep -q 'id="vpngate-disable-single-test"' "$index" || return 1
-    grep -q "const patchVersion = '2026.09.03.3'" "$script" || return 1
+    grep -q "const patchVersion = '2026.09.04.1'" "$script" || return 1
     grep -q "checkStorageKey = 'clashctl/vpngate-ui-check'" "$script" || return 1
     grep -q "querySelectorAll('.collapse')" "$script" || return 1
     grep -q "'.latency-tag'" "$script" || return 1
     grep -q 'const isSelectorGroup' "$script" || return 1
+    grep -q 'data-vpngate-delay' "$script" || return 1
 
     expected=$(sha256sum "$script" | awk '{print substr($1,1,12)}')
     actual=$(grep -oE 'vpngate-ui\.js\?v=[0-9a-f]+' "$index" | head -1 | cut -d= -f2)
@@ -478,7 +538,7 @@ _vpngate_ui_check() {
     fi
 
     if [ -s "$script" ]; then
-        printf '  [OK] 浏览器运行时自检已内置（版本 2026.09.03.3）\n'
+        printf '  [OK] 浏览器运行时自检已内置（版本 2026.09.04.1）\n'
         printf '       结果键：localStorage["clashctl/vpngate-ui-check"]\n'
     fi
 
