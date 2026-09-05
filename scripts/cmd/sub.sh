@@ -855,8 +855,19 @@ EOF
     _with_profiles_lock _sub_use_locked "$name"
 }
 
+# VPNGate 的经前置节点会把 dialer-proxy 固定指向启用时选择的订阅策略组。
+# 切换到不包含该组的新订阅时，继续合并旧 Overlay 必然导致 Mihomo 校验失败。
+_sub_config_has_group() {
+    local path=$1 group=$2
+    [ -n "$group" ] || return 1
+    FRONT_GROUP=$group "$BIN_YQ" -e \
+        '[.proxy-groups[]? | .name == strenv(FRONT_GROUP)] | any' \
+        "$path" >/dev/null 2>&1
+}
+
 _sub_use_locked() {
     local name=$1 rc
+    local vpngate_suspended=false vpngate_front='' vpngate_overlay_backup=''
     _sub_has "$name" || {
         _errorcat "订阅不存在：$name"
         return 1
@@ -877,6 +888,28 @@ _sub_use_locked() {
         _errorcat "无法备份当前配置（磁盘已满？），已取消切换"
         return 1
     }
+
+    # 新订阅不存在原 VPNGate 前置组时，先把 VPNGate Overlay 从本次合并中
+    # 安全移除。订阅切换成功后再正式标记为关闭；若校验失败则完整恢复。
+    if declare -F _vpngate_state_get >/dev/null 2>&1 &&
+        [ "$(_vpngate_state_get enabled 2>/dev/null)" = true ]; then
+        vpngate_front=$(_vpngate_state_get front-group 2>/dev/null)
+        if ! _sub_config_has_group "$path" "$vpngate_front"; then
+            vpngate_overlay_backup="${CLASH_VPNGATE_OVERLAY}.sub-switch.$$"
+            cp "$CLASH_VPNGATE_OVERLAY" "$vpngate_overlay_backup" || {
+                /usr/bin/rm -f "${CLASH_CONFIG_BASE}.bak"
+                _errorcat "无法备份 VPNGate 配置，已取消订阅切换"
+                return 1
+            }
+            if ! _vpngate_write_overlay off ''; then
+                /usr/bin/rm -f "$vpngate_overlay_backup" "${CLASH_CONFIG_BASE}.bak"
+                _errorcat "无法暂时关闭 VPNGate，已取消订阅切换"
+                return 1
+            fi
+            vpngate_suspended=true
+        fi
+    fi
+
     cat "$path" >"$CLASH_CONFIG_BASE"
     _merge_config_restart
     rc=$?
@@ -885,11 +918,24 @@ _sub_use_locked() {
             _errorcat "回滚失败，原配置备份在 ${CLASH_CONFIG_BASE}.bak，请手动恢复"
             return 1
         }
+        if [ "$vpngate_suspended" = true ]; then
+            cp "$vpngate_overlay_backup" "$CLASH_VPNGATE_OVERLAY"
+            /usr/bin/rm -f "$vpngate_overlay_backup"
+            _merge_config >/dev/null 2>&1 || true
+        fi
         /usr/bin/rm -f "${CLASH_CONFIG_BASE}.bak"
         _errorcat "订阅 [$name] 校验未通过（含 Mixin 合并结果），已回滚"
         return 1
     fi
     /usr/bin/rm -f "${CLASH_CONFIG_BASE}.bak"
+
+    if [ "$vpngate_suspended" = true ]; then
+        /usr/bin/rm -f "$vpngate_overlay_backup"
+        _vpngate_state_set_bool enabled false
+        _vpngate_state_set front-group ""
+        _failcat '⚠️' "新订阅不包含原 VPNGate 前置策略组 [$vpngate_front]，VPNGate 已自动关闭" || true
+        _failcat 'ℹ️' "请重新选择新订阅的前置策略组后再启用 VPNGate" || true
+    fi
 
     PROFILE_NAME=$name "$BIN_YQ" -i '.use = strenv(PROFILE_NAME)' "$CLASH_PROFILES_META"
     _logging_sub "🔥 订阅已切换为：[$name] $url"
