@@ -93,7 +93,7 @@ _menu_header() {
 }
 
 _menu_main_summary() {
-    local service_state=未运行 tun_state=关闭 sub=未设置 vg=关闭
+    local service_state=未运行 tun_state=关闭 sub=未设置 vg=关闭 sidecar=关闭
     local route_mode route_leaf timer_state=停止 interval next bind_addr proxy_port
     service_is_active >/dev/null 2>&1 && service_state=运行中
     tunstatus >/dev/null 2>&1 && tun_state=开启
@@ -105,6 +105,7 @@ _menu_main_summary() {
         route_mode=$(_vpngate_route_mode_label)
         route_leaf=$(_vpngate_route_leaf)
     fi
+    _sidecar_is_active >/dev/null 2>&1 && sidecar=开启
     if systemctl is-active --quiet "$VPNGATE_SCHEDULE_TIMER" 2>/dev/null; then
         timer_state=运行中
         interval=$(_vpngate_schedule_interval)
@@ -123,6 +124,11 @@ _menu_main_summary() {
     printf '    %s●%s VPNGate %s%s%s\n' \
         "$([ "$vg" = 开启 ] && printf '%s' "$MENU_GREEN" || printf '%s' "$MENU_RED")" \
         "$MENU_RESET" "$MENU_BOLD" "$vg" "$MENU_RESET"
+    printf '  %s●%s Xray 旁代理 %s%s%s' \
+        "$([ "$sidecar" = 开启 ] && printf '%s' "$MENU_GREEN" || printf '%s' "$MENU_RED")" \
+        "$MENU_RESET" "$MENU_BOLD" "$sidecar" "$MENU_RESET"
+    printf '    %s端口%s  %s\n' "$MENU_DIM" "$MENU_RESET" \
+        "$(_sidecar_state_get port 2>/dev/null || printf '10112')"
     printf '  %s订阅%s  %s\n' "$MENU_DIM" "$MENU_RESET" "$sub"
     if [ "$vg" = 开启 ]; then
         printf '  %s出口%s  %s%s%s\n' "$MENU_DIM" "$MENU_RESET" \
@@ -137,6 +143,72 @@ _menu_main_summary() {
     printf '  %s代理%s  %s:%s\n' "$MENU_DIM" "$MENU_RESET" \
         "${bind_addr:-127.0.0.1}" "${proxy_port:-7890}"
     _menu_rule
+}
+
+_menu_sidecar_import() {
+    local uri
+    printf '输入 Shadowsocks 分享链接（ss://）: '
+    IFS= read -r uri || return
+    [ -n "$uri" ] || { _errorcat '节点链接不能为空' || true; return 1; }
+    clashsidecar import "$uri"
+}
+
+_menu_sidecar_start() {
+    if [ "$(_vpngate_state_get enabled 2>/dev/null)" = true ]; then
+        _menu_confirm '旁代理与 VPNGate 互斥，是否先关闭 VPNGate？' || return 0
+        clashvpngate off || return
+    fi
+    if ! tunstatus >/dev/null 2>&1; then
+        _menu_confirm '旁代理需要主 Mihomo TUN，是否现在开启 TUN？' || return 0
+        clashtun on || return
+    fi
+    clashsidecar start
+}
+
+_menu_sidecar_set_port() {
+    local port current
+    current=$(_sidecar_state_get port 2>/dev/null)
+    printf '新的旁代理端口（当前 %s）: ' "${current:-10112}"
+    IFS= read -r port || return
+    [ -n "$port" ] && clashsidecar port "$port"
+}
+
+_menu_sidecar() {
+    local choice
+    while true; do
+        _menu_clear
+        _menu_header 'Xray 旁代理管理'
+        _menu_options <<'EOF'
+  1. 查看完整状态
+  2. 导入 Shadowsocks 节点
+  3. 开启旁代理
+  4. 测试旁代理出口
+  5. 检测监听端口
+  6. 修改监听端口
+  7. 查看 Xray 核心版本
+  8. 更新 Xray 最新稳定版
+  9. 查看最近 80 行日志
+ 10. 关闭旁代理
+  0. 返回上一级
+EOF
+        _menu_prompt
+        IFS= read -r choice || return
+        case "$choice" in
+        1) clashsidecar status; _menu_pause ;;
+        2) _menu_sidecar_import; _menu_pause ;;
+        3) _menu_sidecar_start; _menu_pause ;;
+        4) clashsidecar test; _menu_pause ;;
+        5) clashsidecar port status; _menu_pause ;;
+        6) _menu_sidecar_set_port; _menu_pause ;;
+        7) clashsidecar core version; _menu_pause ;;
+        8) _menu_confirm '确认通过主 Mihomo 代理端口更新 Xray 最新稳定版？' && \
+            clashsidecar core update latest; _menu_pause ;;
+        9) clashsidecar logs 80; _menu_pause ;;
+        10) _menu_confirm '确认关闭 Xray 旁代理？' && clashsidecar stop; _menu_pause ;;
+        0 | b | B) return ;;
+        *) _errorcat "无效选项：$choice" || true; sleep 1 ;;
+        esac
+    done
 }
 
 _menu_service() {
@@ -542,6 +614,7 @@ _menu_help() {
   7. 停止命令
   8. 配置命令
   9. 内核升级命令
+ 10. Xray 旁代理命令
   0. 返回上一级
 EOF
         _menu_prompt
@@ -556,6 +629,7 @@ EOF
         7) clashoff --help; _menu_pause ;;
         8) clashmixin --help; _menu_pause ;;
         9) clashupgrade --help; _menu_pause ;;
+        10) clashsidecar --help; _menu_pause ;;
         0 | b | B) return ;;
         *) _errorcat "无效选项：$choice" || true; sleep 1 ;;
         esac
@@ -582,6 +656,7 @@ clashmenu() {
   5. TUN 管理
   6. 配置与安全
   7. 所有命令说明
+  8. Xray 旁代理管理
   0. 退出
 EOF
         _menu_prompt
@@ -594,6 +669,7 @@ EOF
         5) _menu_tun ;;
         6) _menu_config ;;
         7) _menu_help ;;
+        8) _menu_sidecar ;;
         0 | q | Q | exit) return ;;
         *) _errorcat "无效选项：$choice" || true; sleep 1 ;;
         esac

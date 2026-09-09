@@ -36,6 +36,18 @@ CLASH_VPNGATE_LOCK="${CLASH_VPNGATE_DIR}/vpngate.lock"
 CLASH_VPNGATE_SCHEDULE_RUNNER="${CLASH_VPNGATE_DIR}/scheduled-update.sh"
 CLASH_CONFIG_LOCK="${CLASH_RESOURCES_DIR}/config.lock"
 
+# 解耦的 Xray 旁代理。它不启用 TUN；出站连接由主 Mihomo TUN 捕获，
+# 因而可以在不把节点写入主配置的前提下复用当前订阅出口。
+CLASH_SIDECAR_DIR="${CLASH_RESOURCES_DIR}/sidecar"
+CLASH_SIDECAR_STATE="${CLASH_SIDECAR_DIR}/state.yaml"
+CLASH_SIDECAR_CONFIG="${CLASH_SIDECAR_DIR}/config.json"
+CLASH_SIDECAR_LOCK="${CLASH_SIDECAR_DIR}/sidecar.lock"
+CLASH_SIDECAR_LOG="${CLASH_SIDECAR_DIR}/xray.log"
+CLASH_SIDECAR_PID="${CLASH_SIDECAR_DIR}/xray.pid"
+CLASH_SIDECAR_SERVICE="clashctl-xray-sidecar.service"
+CLASH_SIDECAR_SERVICE_PATH="/etc/systemd/system/${CLASH_SIDECAR_SERVICE}"
+BIN_XRAY="${BIN_BASE_DIR}/xray"
+
 CLASHCTL_CRON_TAG="# clashctl-auto-update"
 
 _is_port_used() {

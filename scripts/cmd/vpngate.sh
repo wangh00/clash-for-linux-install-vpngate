@@ -136,6 +136,11 @@ _vpngate_require_front_subscription() {
 
 _vpngate_on_locked() {
     _vpngate_init_files
+    if declare -F _sidecar_is_active_or_enabled >/dev/null 2>&1 &&
+        _sidecar_is_active_or_enabled; then
+        _errorcat 'Xray 旁代理处于开启状态；旁代理与 VPNGate 互斥，请先执行 clashctl sidecar stop'
+        return 1
+    fi
     _vpngate_resolve_options
     if [ "$(_vpngate_state_get enabled)" = true ] &&
         service_is_active >/dev/null 2>&1 && tunstatus >/dev/null 2>&1; then

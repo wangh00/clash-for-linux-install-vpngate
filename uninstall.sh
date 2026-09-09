@@ -9,6 +9,7 @@ CLASHCTL_SRC="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
     exit
 }
 declare -F _vpngate_schedule_remove >/dev/null && _vpngate_schedule_remove
+declare -F _sidecar_remove_service >/dev/null && _sidecar_remove_service
 uninstall_service
 
 # 清理旧版 sub update --auto 遗留的自管 crontab

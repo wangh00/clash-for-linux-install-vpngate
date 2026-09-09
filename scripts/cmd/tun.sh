@@ -23,6 +23,11 @@ tunoff() {
         _errorcat "VPNGate 正在运行并强制依赖 TUN，不能单独关闭；请先执行 clashctl vpngate off"
         return 1
     fi
+    if declare -F _sidecar_is_active_or_enabled >/dev/null 2>&1 &&
+        _sidecar_is_active_or_enabled; then
+        _errorcat 'Xray 旁代理正在运行并依赖主 TUN，不能单独关闭；请先执行 clashctl sidecar stop'
+        return 1
+    fi
     tunstatus >/dev/null || return 0
     service_sudo_stop >/dev/null
     service_is_active >&/dev/null || {

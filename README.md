@@ -22,6 +22,7 @@
 | --- | --- |
 | 统一控制中心 | 订阅、节点、TUN、VPNGate 和定时更新统一管理 |
 | 双链路出口 | 支持 VPNGate 直连、经前置和智能自动 |
+| Xray 旁代理 | 独立 mixed 端口、节点导入、核心更新、出口及端口检测 |
 | 可视化操作 | 内置 Zashboard 3.25.0，可测速、选节点和切换出口 |
 
 > [!IMPORTANT]
@@ -35,6 +36,7 @@
 - [打开 Zashboard](#三打开-zashboard-面板)
 - [启用 VPNGate](#四启用-vpngate)
 - [切换 VPNGate 出口](#五在哪里切换-vpngate)
+- [Xray 旁代理](#六xray-旁代理)
 
 ---
 
@@ -234,7 +236,35 @@ clashctl
 
 ---
 
-## 六、后续管理
+## 六、Xray 旁代理
+
+旁代理用于运行不直接加入主 Mihomo 的特殊 Shadowsocks 节点：
+
+```text
+客户端 → Xray 独立端口 → 主 Mihomo TUN → 前置订阅 → Shadowsocks 节点
+```
+
+进入控制中心的“Xray 旁代理管理”，可以导入 `ss://` 分享链接、修改和检测
+监听端口、启动/停止服务、测试出口、查看日志以及更新 Xray 核心。默认端口为
+`10112`，Xray 自身不开启 TUN。
+
+也可以使用命令：
+
+```bash
+clashctl sidecar import 'ss://...'
+clashctl sidecar start
+clashctl sidecar status
+clashctl sidecar test
+clashctl sidecar core update latest
+```
+
+旁代理与 VPNGate 互斥：启用旁代理前必须关闭 VPNGate；旁代理处于开启状态时，
+VPNGate 会拒绝启用。更新 Xray 核心时固定使用主 Mihomo 的代理端口下载，因此
+不依赖 TUN 是否开启。
+
+---
+
+## 七、后续管理
 
 以后只需要运行：
 
@@ -242,8 +272,8 @@ clashctl
 clashctl
 ```
 
-即可从控制中心完成订阅更新、节点选择、VPNGate 状态查看、定时更新、日志、
-综合诊断以及关闭 VPNGate 等操作。
+即可从控制中心完成订阅更新、节点选择、VPNGate 与旁代理状态查看、核心更新、
+定时更新、日志和综合诊断等操作。
 
 ---
 

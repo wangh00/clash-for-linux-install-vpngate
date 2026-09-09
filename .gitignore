@@ -36,6 +36,7 @@ resources/vpngate/.build.*/
 resources/vpngate/.static.*/
 resources/vpngate/.update-backup.*/
 resources/vpngate/.servers.*.csv
+resources/sidecar/
 
 # 本地部署、备份和临时测试目录
 .deploy-*/

@@ -16,6 +16,7 @@ Commands:
   sub                   订阅管理
   node                  节点切换
   vpngate               VPNGate OpenVPN 出口（直连优先、前置回退）
+  sidecar               Xray 旁代理管理（独立端口、核心更新、状态检测）
   tun                   Tun 模式
   mixin                 Mixin 配置
   secret                Web 密钥
