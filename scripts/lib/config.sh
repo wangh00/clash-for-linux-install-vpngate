@@ -82,7 +82,7 @@ _get_secret() {
 _configure_lan_proxy() {
   local port=${CLASHCTL_MIXED_PORT:-7890}
   local bind_addr=${CLASHCTL_LAN_BIND_ADDRESS:-0.0.0.0}
-  local allow_lan=false username=${CLASHCTL_PROXY_USERNAME:-vpngate}
+  local allow_lan=false username=${CLASHCTL_PROXY_USERNAME:-admin}
   local password=${CLASHCTL_PROXY_PASSWORD:-}
   [ "${CLASHCTL_LAN_ALLOW:-1}" = 1 ] && allow_lan=true
 

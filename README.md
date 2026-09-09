@@ -1,6 +1,6 @@
 <h1 align="center">Clash for Linux · VPNGate</h1>
 
-<p align="center"><strong>基于 Mihomo 的订阅代理与 VPNGate 出口管理工具</strong></p>
+<p align="center"><strong>基于 Mihomo 的订阅代理、VPNGate 出口与 Xray 旁代理管理工具</strong></p>
 
 <p align="center">
 无需额外安装 OpenVPN、Python 服务或 Docker，安装完成后统一通过
@@ -20,9 +20,9 @@
 
 | 功能 | 说明 |
 | --- | --- |
-| 统一控制中心 | 订阅、节点、TUN、VPNGate 和定时更新统一管理 |
+| 统一控制中心 | 订阅、节点、TUN、VPNGate、Xray 旁代理和定时更新统一管理 |
 | 双链路出口 | 支持 VPNGate 直连、经前置和智能自动 |
-| Xray 旁代理 | 独立 mixed 端口、节点导入、核心更新、出口及端口检测 |
+| Xray 旁代理 | 支持 SS/VLESS/VMess/Trojan，提供独立 mixed 端口和核心更新 |
 | 可视化操作 | 内置 Zashboard 3.25.0，可测速、选节点和切换出口 |
 
 > [!IMPORTANT]
@@ -37,6 +37,8 @@
 - [启用 VPNGate](#四启用-vpngate)
 - [切换 VPNGate 出口](#五在哪里切换-vpngate)
 - [Xray 旁代理](#六xray-旁代理)
+- [运行模式与互斥关系](#七运行模式与互斥关系)
+- [后续管理](#八后续管理)
 
 ---
 
@@ -68,9 +70,11 @@ git clone --branch main --depth 1 https://ghfast.top/https://github.com/wangh00/
 - 安装目录：`~/clashctl`；
 - 局域网 HTTP/SOCKS5 共用端口：`7890`；
 - 监听地址：`0.0.0.0`；
-- 代理用户名：`vpngate`；
+- 代理用户名：`admin`；
 - 代理密码：安装时随机生成；
-- 初始订阅：留空，安装后从 `clashctl` 控制中心添加。
+- 初始订阅：留空，安装后从 `clashctl` 控制中心添加；
+- Xray：不随主程序预下载，首次开启旁代理时通过 Mihomo 按需下载最新版；
+- Xray 旁代理监听：`0.0.0.0:10112`。
 
 ### 可选：安装前自定义
 
@@ -84,6 +88,15 @@ bash install.sh
 
 > 项目默认已配置 `CLASHCTL_KERNEL=mihomo`，不需要在命令后面再加
 > `mihomo`。
+
+如果只想修改默认代理账号，可以在 `.env.install.local` 中设置：
+
+```bash
+CLASHCTL_PROXY_USERNAME=admin
+CLASHCTL_PROXY_PASSWORD=你的密码
+```
+
+密码留空时仍会在安装过程中安全地随机生成。
 
 安装完成后，让当前终端加载 `clashctl`：
 
@@ -266,9 +279,46 @@ clashctl sidecar core update latest
 VPNGate 会拒绝启用。更新 Xray 核心时固定使用主 Mihomo 的代理端口下载，因此
 不依赖 TUN 是否开启。
 
+### Xray 核心什么时候下载
+
+项目安装和主 Mihomo 启动时不会下载 Xray。首次执行：
+
+```bash
+clashctl sidecar start
+```
+
+如果检测不到 `~/clashctl/bin/xray`，控制中心才会通过主 Mihomo 的 `7890`
+端口查询、下载并校验最新稳定版。以后开启旁代理直接复用已有核心。也可以提前
+安装或随时更新：
+
+```bash
+clashctl sidecar core update latest
+```
+
 ---
 
-## 七、后续管理
+## 七、运行模式与互斥关系
+
+```text
+普通代理：Mihomo + 可选 TUN
+VPNGate ：Mihomo + TUN + VPNGate（Xray 旁代理必须关闭）
+旁代理  ：Mihomo + TUN + Xray（VPNGate 必须关闭）
+```
+
+控制中心会同时显示主代理和旁代理入口：
+
+```text
+● Mihomo 运行中    ● TUN 开启    ● VPNGate 关闭
+↳ 0.0.0.0:7890                   ● Xray 旁代理 开启
+                                 ↳ 0.0.0.0:10112
+```
+
+VPNGate 定时更新只在 VPNGate 启用期间运行。关闭 VPNGate 后 systemd timer
+会暂停，但保留更新间隔；下次启用 VPNGate 时自动恢复。
+
+---
+
+## 八、后续管理
 
 以后只需要运行：
 
