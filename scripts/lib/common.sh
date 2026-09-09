@@ -140,6 +140,9 @@ _errorcat() {
 # 估算字符串终端显示宽度：CJK/emoji 计 2 列，旗帜按对各计 1（合 2），
 # VS16(FE0F) 把前一字符提升为宽。依赖 UTF-8 locale 下的逐字符索引。
 _dispwidth() {
+    # 安装环境经常是 LANG=C；显式切到 UTF-8，否则 Bash 会按字节遍历中文，
+    # 菜单列宽会被高估，状态卡片无法竖向对齐。
+    local LC_ALL=${CLASHCTL_UTF8_LOCALE:-C.UTF-8}
     local s=$1 w=0 i c cp
     for ((i = 0; i < ${#s}; i++)); do
         c=${s:i:1}

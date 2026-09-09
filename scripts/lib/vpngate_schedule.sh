@@ -86,6 +86,10 @@ _vpngate_schedule_start() {
         _errorcat "用法：clashctl vpngate schedule start [分钟]"
         return 1
     }
+    [ "$(_vpngate_state_get enabled)" = true ] || {
+        _errorcat 'VPNGate 未启用；定时任务只会随 VPNGate 运行，请先执行 clashctl vpngate on'
+        return 1
+    }
     _vpngate_schedule_write_units "$interval" || return
     systemctl enable "$VPNGATE_SCHEDULE_TIMER" >/dev/null || return
     systemctl restart "$VPNGATE_SCHEDULE_TIMER" || return
@@ -100,19 +104,39 @@ _vpngate_schedule_set_interval() {
         _errorcat "用法：clashctl vpngate schedule interval <分钟>"
         return 1
     }
-    local interval=$1 was_active=false
+    local interval=$1 should_run=false
     _vpngate_schedule_validate_interval "$interval" || return
-    systemctl is-active --quiet "$VPNGATE_SCHEDULE_TIMER" 2>/dev/null && was_active=true
-    _vpngate_schedule_write_units "$interval" || return
-    _vpngate_state_set_num auto-update-interval "$interval"
-    if [ "$was_active" = true ]; then
+    if [ "$(_vpngate_state_get enabled)" = true ] &&
+        [ "$(_vpngate_state_get auto-update-enabled)" = true ]; then
+        should_run=true
+    fi
+    if [ "$should_run" = true ]; then
+        _vpngate_schedule_write_units "$interval" || return
+        _vpngate_state_set_num auto-update-interval "$interval"
         systemctl restart "$VPNGATE_SCHEDULE_TIMER" || return
-        _vpngate_state_set_bool auto-update-enabled true
         _okcat '✅' "VPNGate 定时更新间隔已改为 $interval 分钟，计时已重新开始"
     else
-        _vpngate_state_set_bool auto-update-enabled false
-        _okcat '✅' "VPNGate 定时更新间隔已改为 $interval 分钟（任务仍为停止状态）"
+        _vpngate_state_set_num auto-update-interval "$interval"
+        _okcat '✅' "VPNGate 定时更新间隔已保存为 $interval 分钟（当前不运行）"
     fi
+}
+
+# 暂停实际 timer，但保留用户“自动更新已配置”的偏好；下次 VPNGate 成功
+# 启用后会恢复。VPNGate 关闭期间 systemd 不再周期唤醒空跑。
+_vpngate_schedule_pause() {
+    command -v systemctl >/dev/null 2>&1 || return 0
+    systemctl disable --now "$VPNGATE_SCHEDULE_TIMER" >/dev/null 2>&1 || true
+}
+
+_vpngate_schedule_resume_if_configured() {
+    [ "$(_vpngate_state_get enabled)" = true ] || return 0
+    [ "$(_vpngate_state_get auto-update-enabled)" = true ] || return 0
+    local interval
+    interval=$(_vpngate_schedule_interval)
+    _vpngate_schedule_write_units "$interval" || return
+    systemctl enable "$VPNGATE_SCHEDULE_TIMER" >/dev/null || return
+    systemctl restart "$VPNGATE_SCHEDULE_TIMER" || return
+    _okcat '⏱️' "VPNGate 定时更新已随服务恢复：每 $interval 分钟"
 }
 
 _vpngate_schedule_stop() {
@@ -131,11 +155,12 @@ _vpngate_schedule_run() {
     _vpngate_state_set last-auto-result running
     _vpngate_state_set last-auto-error ""
 
-    # 定时器可以保持启用而 VPNGate 模式临时关闭；这种情况正常跳过，不把
-    # systemd unit 标成失败。重新开启 VPNGate 后下个周期会自动恢复检查。
+    # 兼容旧版本遗留的“VPNGate 已关闭但 timer 仍运行”状态：本次唤醒只做
+    # 一次迁移性暂停，此后关闭期间不再周期空跑。
     if [ "$(_vpngate_state_get enabled)" != true ]; then
-        _vpngate_state_set last-auto-result skipped-disabled
-        _okcat 'ℹ️' "VPNGate 当前未启用，本次定时更新已跳过"
+        _vpngate_schedule_pause
+        _vpngate_state_set last-auto-result suspended-disabled
+        _okcat 'ℹ️' "VPNGate 当前未启用，定时任务已暂停；下次启用后恢复"
         return 0
     fi
 
@@ -171,9 +196,10 @@ _vpngate_schedule_next() {
 
 _vpngate_schedule_status() {
     _vpngate_init_files
-    local interval configured active=停止 enabled=否 next='未安排' last_check last_result last_error
+    local interval configured vpngate_enabled active=停止 enabled=否 next='未安排' last_check last_result last_error
     interval=$(_vpngate_schedule_interval)
     configured=$(_vpngate_state_get auto-update-enabled)
+    vpngate_enabled=$(_vpngate_state_get enabled)
 
     if command -v systemctl >/dev/null 2>&1; then
         systemctl is-active --quiet "$VPNGATE_SCHEDULE_TIMER" 2>/dev/null && active=运行中
@@ -183,6 +209,11 @@ _vpngate_schedule_status() {
             [ -n "$next" ] || next='等待 systemd 计算'
         fi
     fi
+    if [ "$active" != 运行中 ] && [ "$configured" = true ] &&
+        [ "$vpngate_enabled" != true ]; then
+        active='随 VPNGate 暂停'
+        next='启用 VPNGate 后恢复'
+    fi
     last_check=$(_vpngate_state_get last-auto-check)
     last_result=$(_vpngate_state_get last-auto-result)
     last_error=$(_vpngate_state_get last-auto-error)
@@ -191,7 +222,7 @@ _vpngate_schedule_status() {
 VPNGate 定时更新
   运行状态：$active
   开机启用：$enabled
-  配置记录：${configured:-false}
+  自动更新：$([ "$configured" = true ] && printf '已配置' || printf '未配置')
   更新间隔：$interval 分钟
   下次执行：$next
   上次执行：${last_check:-从未}
@@ -224,8 +255,9 @@ Usage:
   clashctl vpngate schedule stop
   clashctl vpngate schedule run
 
-默认每 60 分钟检查一次。节点没有变化时不会重启 Mihomo；发生变化时会
-事务化加载新节点，并尽量恢复两个可见组更新前的手动选择。
+默认每 60 分钟检查一次。定时任务只在 VPNGate 启用期间运行；关闭时自动
+暂停，再次启用时恢复。节点没有变化时不会重启 Mihomo；发生变化时会事务化
+加载新节点，并尽量恢复两个可见组更新前的手动选择。
 EOF
         ;;
     *)

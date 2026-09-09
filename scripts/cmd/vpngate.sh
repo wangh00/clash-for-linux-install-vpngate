@@ -212,6 +212,8 @@ _vpngate_on_locked() {
     _vpngate_state_set last-apply-method restart
     _vpngate_state_set_bool enabled true
     _okcat '✅' "VPNGate 已启用：前置=[$VPNGATE_FRONT] 国家=${VPNGATE_COUNTRY:-ALL} 节点=$VPNGATE_GENERATED_COUNT"
+    _vpngate_schedule_resume_if_configured ||
+        _failcat '⚠️' 'VPNGate 已启用，但定时更新恢复失败；可在定时更新管理中重试' || true
 }
 
 _vpngate_restore_one_selection() {
@@ -368,7 +370,8 @@ _vpngate_off_locked() {
     _vpngate_write_overlay off '' || return
     _merge_config_restart || return
     _vpngate_state_set_bool enabled false
-    _okcat '✅' "VPNGate 已关闭；TUN 已恢复为用户 Mixin 中的原状态"
+    _vpngate_schedule_pause
+    _okcat '✅' "VPNGate 已关闭；定时更新已暂停，TUN 已恢复为用户 Mixin 中的原状态"
 }
 
 _vpngate_front() {
@@ -687,7 +690,7 @@ Usage:
   clashctl vpngate test                       测试 VPNGate-AUTO 策略组
   clashctl vpngate status                     查看状态
   clashctl vpngate schedule status            查看定时更新状态
-  clashctl vpngate schedule start [分钟]      启动定时更新（默认 60 分钟）
+  clashctl vpngate schedule start [分钟]      启动定时更新（仅 VPNGate 启用期间）
   clashctl vpngate schedule interval <分钟>   修改定时更新间隔
   clashctl vpngate schedule stop              停止定时更新
   clashctl vpngate schedule run               立即执行一次更新检查

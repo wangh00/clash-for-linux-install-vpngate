@@ -110,44 +110,58 @@ _menu_main_summary() {
         timer_state=运行中
         interval=$(_vpngate_schedule_interval)
         next=$(_vpngate_schedule_next)
+    elif [ "$vg" != 开启 ] && [ "$(_vpngate_state_get auto-update-enabled 2>/dev/null)" = true ]; then
+        timer_state='随 VPNGate 暂停'
     fi
     bind_addr=$(_get_bind_addr 2>/dev/null)
     proxy_port=$("$BIN_YQ" '.mixed-port // .port // .socks-port // 7890' \
         "$CLASH_CONFIG_RUNTIME" 2>/dev/null)
 
-    printf '\n  %s●%s Mihomo %s%s%s' \
+    local sidecar_port sidecar_listen row1a row1b row1c row2a row2c row3c
+    sidecar_port=$(_sidecar_state_get port 2>/dev/null || printf '10112')
+    sidecar_listen=$(_sidecar_state_get listen 2>/dev/null || printf '0.0.0.0')
+    row1a="● Mihomo $service_state"
+    row1b="● TUN $tun_state"
+    row1c="● VPNGate $vg"
+    row2a="↳ ${bind_addr:-127.0.0.1}:${proxy_port:-7890}"
+    row2c="● Xray 旁代理 $sidecar"
+    row3c="↳ ${sidecar_listen:-0.0.0.0}:${sidecar_port:-10112}"
+
+    printf '\n  %s●%s %sMihomo %s%s' \
         "$([ "$service_state" = 运行中 ] && printf '%s' "$MENU_GREEN" || printf '%s' "$MENU_RED")" \
         "$MENU_RESET" "$MENU_BOLD" "$service_state" "$MENU_RESET"
-    printf '    %s●%s TUN %s%s%s' \
+    printf '%*s' "$((19 - $(_dispwidth "$row1a")))" ''
+    printf '%s●%s %sTUN %s%s' \
         "$([ "$tun_state" = 开启 ] && printf '%s' "$MENU_GREEN" || printf '%s' "$MENU_RED")" \
         "$MENU_RESET" "$MENU_BOLD" "$tun_state" "$MENU_RESET"
-    printf '    %s●%s VPNGate %s%s%s\n' \
+    printf '%*s' "$((14 - $(_dispwidth "$row1b")))" ''
+    printf '%s●%s %sVPNGate %s%s\n' \
         "$([ "$vg" = 开启 ] && printf '%s' "$MENU_GREEN" || printf '%s' "$MENU_RED")" \
         "$MENU_RESET" "$MENU_BOLD" "$vg" "$MENU_RESET"
-    printf '  %s●%s Xray 旁代理 %s%s%s' \
+    printf '  %s' "$MENU_DIM"; _pad "$row2a" 19; printf '%s' "$MENU_RESET"
+    printf '%*s' 14 ''
+    printf '%s●%s %sXray 旁代理 %s%s\n' \
         "$([ "$sidecar" = 开启 ] && printf '%s' "$MENU_GREEN" || printf '%s' "$MENU_RED")" \
         "$MENU_RESET" "$MENU_BOLD" "$sidecar" "$MENU_RESET"
-    printf '    %s端口%s  %s\n' "$MENU_DIM" "$MENU_RESET" \
-        "$(_sidecar_state_get port 2>/dev/null || printf '10112')"
-    printf '  %s订阅%s  %s\n' "$MENU_DIM" "$MENU_RESET" "$sub"
+    printf '  %*s%s%s%s\n' 33 '' "$MENU_DIM" "$row3c" "$MENU_RESET"
+
+    printf '\n  %s◇ 订阅%s  %s\n' "$MENU_BLUE" "$MENU_RESET" "$sub"
     if [ "$vg" = 开启 ]; then
         printf '  %s出口%s  %s%s%s\n' "$MENU_DIM" "$MENU_RESET" \
             "$MENU_GREEN" "${route_mode:-未获取}" "$MENU_RESET"
         printf '  %s节点%s  %s\n' "$MENU_DIM" "$MENU_RESET" "${route_leaf:-未获取}"
     fi
-    printf '  %s更新%s  %s%s%s' "$MENU_DIM" "$MENU_RESET" \
+    printf '  %s◇ 更新%s  %s%s%s' "$MENU_BLUE" "$MENU_RESET" \
         "$([ "$timer_state" = 运行中 ] && printf '%s' "$MENU_GREEN" || printf '%s' "$MENU_YELLOW")" \
         "$timer_state" "$MENU_RESET"
     [ "$timer_state" = 运行中 ] && printf ' · %s 分钟 · 下次 %s' "$interval" "${next:-等待计算}"
     printf '\n'
-    printf '  %s代理%s  %s:%s\n' "$MENU_DIM" "$MENU_RESET" \
-        "${bind_addr:-127.0.0.1}" "${proxy_port:-7890}"
     _menu_rule
 }
 
 _menu_sidecar_import() {
     local uri
-    printf '输入 Shadowsocks 分享链接（ss://）: '
+    printf '输入节点分享链接（ss/vless/vmess/trojan）: '
     IFS= read -r uri || return
     [ -n "$uri" ] || { _errorcat '节点链接不能为空' || true; return 1; }
     clashsidecar import "$uri"
@@ -174,13 +188,21 @@ _menu_sidecar_set_port() {
 }
 
 _menu_sidecar() {
-    local choice
+    local choice node protocol listen port
     while true; do
         _menu_clear
         _menu_header 'Xray 旁代理管理'
+        listen=$(_sidecar_state_get listen 2>/dev/null); [ -n "$listen" ] || listen=0.0.0.0
+        port=$(_sidecar_state_get port 2>/dev/null); [ -n "$port" ] || port=10112
+        node=$(_sidecar_state_get node-name 2>/dev/null); [ -n "$node" ] || node=未导入
+        protocol=$(_sidecar_state_get protocol 2>/dev/null); [ -n "$protocol" ] || protocol=unknown
+        printf '\n  %s独立入口%s  %s:%s\n' "$MENU_DIM" "$MENU_RESET" \
+            "$listen" "$port"
+        printf '  %s当前节点%s  %s  %s[%s]%s\n\n' "$MENU_DIM" "$MENU_RESET" \
+            "$node" "$MENU_BLUE" "$protocol" "$MENU_RESET"
         _menu_options <<'EOF'
   1. 查看完整状态
-  2. 导入 Shadowsocks 节点
+  2. 导入节点（SS / VLESS / VMess / Trojan）
   3. 开启旁代理
   4. 测试旁代理出口
   5. 检测监听端口

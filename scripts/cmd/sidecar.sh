@@ -15,7 +15,7 @@ clashsidecar() {
         ;;
     import | add)
         [ $# -eq 1 ] || {
-            _errorcat '用法：clashctl sidecar import <ss://分享链接>'
+            _errorcat '用法：clashctl sidecar import <节点分享链接>'
             return 1
         }
         _sidecar_with_lock _sidecar_import_locked "$1"
@@ -99,7 +99,7 @@ sidecar_help() {
     cat <<EOF
 Usage:
   clashctl sidecar status
-  clashctl sidecar import <ss://分享链接>
+  clashctl sidecar import <节点分享链接>
   clashctl sidecar start|stop
   clashctl sidecar port [端口]
   clashctl sidecar test [URL]
@@ -112,6 +112,9 @@ Usage:
   - 启动旁代理前必须开启主 Mihomo TUN，并关闭 VPNGate。
   - 旁代理与 VPNGate 互斥，旁代理运行时 VPNGate 不能启用。
   - 核心更新固定通过主 Mihomo 代理端口下载，不依赖 TUN 状态。
+  - 分享链接支持 Shadowsocks、VLESS、VMess（含旧版 Base64 JSON）和 Trojan。
+  - 支持 TCP/RAW、WebSocket、gRPC、HTTP/2、HTTPUpgrade、XHTTP、mKCP，
+    以及 TLS/REALITY 传输安全参数；每次导入会事务化替换当前旁代理节点。
 
 EOF
 }

@@ -196,7 +196,8 @@ clashctl
 自动开启 TUN、通过前置订阅获取 VPNGate API，并生成直连和经前置两组节点。
 
 启用后建议在“VPNGate 管理”中进入“定时更新管理”，启动默认 60 分钟的
-自动更新，避免公共中继过期。
+自动更新，避免公共中继过期。定时任务与 VPNGate 生命周期联动：关闭 VPNGate
+时会真正暂停 systemd timer，再次启用时按原间隔恢复，不会在关闭期间空跑。
 
 ---
 
@@ -238,20 +239,23 @@ clashctl
 
 ## 六、Xray 旁代理
 
-旁代理用于运行不直接加入主 Mihomo 的特殊 Shadowsocks 节点：
+旁代理用于运行不直接加入主 Mihomo 的特殊节点，当前支持 Shadowsocks、VLESS、
+VMess（含旧版 Base64 JSON 分享格式）和 Trojan：
 
 ```text
-客户端 → Xray 独立端口 → 主 Mihomo TUN → 前置订阅 → Shadowsocks 节点
+客户端 → Xray 独立端口 → 主 Mihomo TUN → 前置订阅 → 旁代理节点
 ```
 
-进入控制中心的“Xray 旁代理管理”，可以导入 `ss://` 分享链接、修改和检测
-监听端口、启动/停止服务、测试出口、查看日志以及更新 Xray 核心。默认端口为
-`10112`，Xray 自身不开启 TUN。
+进入控制中心的“Xray 旁代理管理”，可以导入 `ss://`、`vless://`、`vmess://`
+和 `trojan://` 分享链接，修改和检测监听端口、启动/停止服务、测试出口、查看
+日志以及更新 Xray 核心。支持常见 TCP/RAW、WebSocket、gRPC、HTTPUpgrade、
+XHTTP 和 mKCP 传输，以及 TLS/REALITY 参数；旧 HTTP/H2 和 mKCP 分享参数会
+转换为 Xray 26 的兼容结构。默认监听为 `0.0.0.0:10112`，Xray 自身不开启 TUN。
 
 也可以使用命令：
 
 ```bash
-clashctl sidecar import 'ss://...'
+clashctl sidecar import 'vless://...'
 clashctl sidecar start
 clashctl sidecar status
 clashctl sidecar test

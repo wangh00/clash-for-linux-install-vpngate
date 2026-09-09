@@ -12,9 +12,12 @@ enabled: false
 listen: "${CLASHCTL_SIDECAR_LISTEN:-0.0.0.0}"
 port: ${CLASHCTL_SIDECAR_PORT:-10112}
 node-name: ""
+protocol: ""
 server: ""
 server-port: 0
 method: ""
+transport: ""
+security: ""
 core-version: ""
 updated-at: ""
 last-test-at: ""
@@ -22,6 +25,23 @@ last-test-ip: ""
 last-error: ""
 EOF
     chmod 600 "$CLASH_SIDECAR_STATE" 2>/dev/null || true
+    # 从只记录 Shadowsocks 的旧状态平滑迁移，配置文件仍是运行事实来源。
+    if [ -s "$CLASH_SIDECAR_CONFIG" ] && ! grep -q '^protocol:' "$CLASH_SIDECAR_STATE"; then
+        local protocol transport security
+        protocol=$("$BIN_YQ" -p=json -r '.outbounds[0].protocol // ""' \
+            "$CLASH_SIDECAR_CONFIG" 2>/dev/null)
+        transport=$("$BIN_YQ" -p=json -r \
+            '.outbounds[0].streamSettings.network // .outbounds[0].streamSettings.method // "tcp"' \
+            "$CLASH_SIDECAR_CONFIG" 2>/dev/null)
+        security=$("$BIN_YQ" -p=json -r '.outbounds[0].streamSettings.security // "none"' \
+            "$CLASH_SIDECAR_CONFIG" 2>/dev/null)
+        STATE_PROTOCOL=${protocol:-shadowsocks} STATE_TRANSPORT=${transport:-tcp} \
+            STATE_SECURITY=${security:-none} "$BIN_YQ" -i '
+              .protocol = strenv(STATE_PROTOCOL) |
+              .transport = strenv(STATE_TRANSPORT) |
+              .security = strenv(STATE_SECURITY)
+            ' "$CLASH_SIDECAR_STATE"
+    fi
 }
 
 _sidecar_state_get() {
@@ -328,16 +348,96 @@ _sidecar_b64_decode() {
 }
 
 _sidecar_url_decode() {
-    local value=${1//+/ }
-    printf '%b' "${value//%/\\x}"
+    local value=$1 output='' prefix rest hex decoded
+    while [[ "$value" == *%* ]]; do
+        prefix=${value%%\%*}
+        rest=${value#*%}
+        hex=${rest:0:2}
+        [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]] && [ "$hex" != 00 ] || {
+            _errorcat '节点链接包含无效的 URL 转义'
+            return 1
+        }
+        printf -v decoded '%b' "\\x$hex"
+        output+="$prefix$decoded"
+        value=${rest:2}
+    done
+    printf '%s' "$output$value"
+}
+
+_sidecar_query_get() {
+    local query=$1 wanted=$2 default=${3:-} pair key value
+    while IFS= read -r pair; do
+        key=${pair%%=*}
+        [ "$key" = "$wanted" ] || continue
+        if [[ "$pair" == *=* ]]; then
+            value=${pair#*=}
+        else
+            value=''
+        fi
+        _sidecar_url_decode "$value" || return
+        return 0
+    done < <(tr '&' '\n' <<<"$query")
+    printf '%s' "$default"
+}
+
+_sidecar_clean_label() {
+    LC_ALL=C tr -d '\000-\037\177'
+}
+
+_sidecar_parse_host_port() {
+    local hostport=$1 label=${2:-节点}
+    if [[ "$hostport" == \[*\]:* ]]; then
+        SIDECAR_NODE_SERVER=${hostport#\[}
+        SIDECAR_NODE_SERVER=${SIDECAR_NODE_SERVER%%\]*}
+        SIDECAR_NODE_PORT=${hostport##*:}
+    else
+        SIDECAR_NODE_SERVER=${hostport%:*}
+        SIDECAR_NODE_PORT=${hostport##*:}
+    fi
+    [[ "$SIDECAR_NODE_PORT" =~ ^[0-9]+$ ]] &&
+        ((SIDECAR_NODE_PORT >= 1 && SIDECAR_NODE_PORT <= 65535)) || {
+        _errorcat "$label服务器端口无效"
+        return 1
+    }
+    [ -n "$SIDECAR_NODE_SERVER" ] || {
+        _errorcat "$label服务器地址为空"
+        return 1
+    }
+}
+
+_sidecar_reset_node_vars() {
+    SIDECAR_NODE_PROTOCOL=''
+    SIDECAR_NODE_NAME=''
+    SIDECAR_NODE_SERVER=''
+    SIDECAR_NODE_PORT=''
+    SIDECAR_NODE_USER=''
+    SIDECAR_NODE_ALTER_ID=0
+    SIDECAR_NODE_PASSWORD=''
+    SIDECAR_NODE_METHOD=''
+    SIDECAR_NODE_TRANSPORT='tcp'
+    SIDECAR_NODE_SECURITY='none'
+    SIDECAR_NODE_FLOW=''
+    SIDECAR_NODE_SNI=''
+    SIDECAR_NODE_FP=''
+    SIDECAR_NODE_ALPN=''
+    SIDECAR_NODE_INSECURE='false'
+    SIDECAR_NODE_HOST=''
+    SIDECAR_NODE_PATH=''
+    SIDECAR_NODE_HEADER_TYPE=''
+    SIDECAR_NODE_SEED=''
+    SIDECAR_NODE_SERVICE_NAME=''
+    SIDECAR_NODE_AUTHORITY=''
+    SIDECAR_NODE_MODE=''
+    SIDECAR_NODE_EXTRA=''
+    SIDECAR_NODE_PBK=''
+    SIDECAR_NODE_SID=''
+    SIDECAR_NODE_SPX=''
 }
 
 _sidecar_parse_ss_uri() {
     local uri=$1 body fragment authority userinfo hostport credentials decoded
-    [[ "$uri" == ss://* ]] || {
-        _errorcat '当前只支持导入 ss:// 节点'
-        return 1
-    }
+    [[ "$uri" == ss://* ]] || return 1
+    SIDECAR_NODE_PROTOCOL=shadowsocks
     body=${uri#ss://}
     fragment=''
     if [[ "$body" == *#* ]]; then
@@ -355,7 +455,7 @@ _sidecar_parse_ss_uri() {
     if [[ "$body" == *@* ]]; then
         userinfo=${body%@*}
         hostport=${body##*@}
-        userinfo=$(_sidecar_url_decode "$userinfo")
+        userinfo=$(_sidecar_url_decode "$userinfo") || return
         if [[ "$userinfo" == *:* ]]; then
             credentials=$userinfo
         else
@@ -377,70 +477,372 @@ _sidecar_parse_ss_uri() {
     SIDECAR_NODE_METHOD=${credentials%%:*}
     SIDECAR_NODE_PASSWORD=${credentials#*:}
 
-    if [[ "$hostport" == \[*\]:* ]]; then
-        SIDECAR_NODE_SERVER=${hostport#\[}
-        SIDECAR_NODE_SERVER=${SIDECAR_NODE_SERVER%%\]*}
-        SIDECAR_NODE_PORT=${hostport##*:}
-    else
-        SIDECAR_NODE_SERVER=${hostport%:*}
-        SIDECAR_NODE_PORT=${hostport##*:}
-    fi
-    [[ "$SIDECAR_NODE_PORT" =~ ^[0-9]+$ ]] &&
-        ((SIDECAR_NODE_PORT >= 1 && SIDECAR_NODE_PORT <= 65535)) || {
-        _errorcat 'Shadowsocks 服务器端口无效'
-        return 1
-    }
+    _sidecar_parse_host_port "$hostport" Shadowsocks || return
     [ -n "$SIDECAR_NODE_SERVER" ] && [ -n "$SIDECAR_NODE_METHOD" ] &&
         [ -n "$SIDECAR_NODE_PASSWORD" ] || {
         _errorcat 'Shadowsocks 链接字段不完整'
         return 1
     }
-    SIDECAR_NODE_NAME=$(_sidecar_url_decode "$fragment")
+    SIDECAR_NODE_NAME=$(_sidecar_url_decode "$fragment") || return
     [ -n "$SIDECAR_NODE_NAME" ] ||
         SIDECAR_NODE_NAME="${SIDECAR_NODE_SERVER}:${SIDECAR_NODE_PORT}"
 }
 
-_sidecar_write_ss_config() {
-    local target=$1 listen=$2 port=$3
-    SIDECAR_LISTEN=$listen SIDECAR_PORT=$port SIDECAR_METHOD=$SIDECAR_NODE_METHOD \
-        SIDECAR_PASSWORD=$SIDECAR_NODE_PASSWORD SIDECAR_SERVER=$SIDECAR_NODE_SERVER \
-        SIDECAR_SERVER_PORT=$SIDECAR_NODE_PORT "$BIN_YQ" -n -o=json '
+_sidecar_parse_standard_uri() {
+    local uri=$1 scheme=$2 body fragment='' query='' authority userinfo hostport
+    body=${uri#*://}
+    if [[ "$body" == *#* ]]; then
+        fragment=${body#*#}
+        body=${body%%#*}
+    fi
+    if [[ "$body" == *\?* ]]; then
+        query=${body#*\?}
+        body=${body%%\?*}
+    fi
+    [[ "$body" == *@* ]] || {
+        _errorcat "无法解析 ${scheme^^} 分享链接"
+        return 1
+    }
+    userinfo=$(_sidecar_url_decode "${body%@*}") || return
+    hostport=${body##*@}
+    _sidecar_parse_host_port "$hostport" "${scheme^^}" || return
+    [ -n "$userinfo" ] || {
+        _errorcat "${scheme^^} 链接缺少用户 ID 或密码"
+        return 1
+    }
+
+    SIDECAR_NODE_PROTOCOL=$scheme
+    SIDECAR_NODE_USER=$userinfo
+    SIDECAR_NODE_NAME=$(_sidecar_url_decode "$fragment") || return
+    SIDECAR_NODE_TRANSPORT=$(_sidecar_query_get "$query" type tcp) || return
+    SIDECAR_NODE_SECURITY=$(_sidecar_query_get "$query" security none) || return
+    SIDECAR_NODE_FLOW=$(_sidecar_query_get "$query" flow '') || return
+    SIDECAR_NODE_SNI=$(_sidecar_query_get "$query" sni '') || return
+    SIDECAR_NODE_FP=$(_sidecar_query_get "$query" fp '') || return
+    SIDECAR_NODE_ALPN=$(_sidecar_query_get "$query" alpn '') || return
+    SIDECAR_NODE_INSECURE=$(_sidecar_query_get "$query" allowInsecure false) || return
+    [ "$SIDECAR_NODE_INSECURE" != false ] ||
+        SIDECAR_NODE_INSECURE=$(_sidecar_query_get "$query" insecure false) || return
+    SIDECAR_NODE_HOST=$(_sidecar_query_get "$query" host '') || return
+    SIDECAR_NODE_PATH=$(_sidecar_query_get "$query" path '') || return
+    SIDECAR_NODE_HEADER_TYPE=$(_sidecar_query_get "$query" headerType '') || return
+    SIDECAR_NODE_SEED=$(_sidecar_query_get "$query" seed '') || return
+    SIDECAR_NODE_SERVICE_NAME=$(_sidecar_query_get "$query" serviceName '') || return
+    [ -n "$SIDECAR_NODE_SERVICE_NAME" ] ||
+        SIDECAR_NODE_SERVICE_NAME=$SIDECAR_NODE_PATH
+    SIDECAR_NODE_AUTHORITY=$(_sidecar_query_get "$query" authority '') || return
+    SIDECAR_NODE_MODE=$(_sidecar_query_get "$query" mode '') || return
+    SIDECAR_NODE_EXTRA=$(_sidecar_query_get "$query" extra '') || return
+    SIDECAR_NODE_PBK=$(_sidecar_query_get "$query" pbk '') || return
+    SIDECAR_NODE_SID=$(_sidecar_query_get "$query" sid '') || return
+    SIDECAR_NODE_SPX=$(_sidecar_query_get "$query" spx '') || return
+    [ -n "$SIDECAR_NODE_NAME" ] ||
+        SIDECAR_NODE_NAME="${SIDECAR_NODE_SERVER}:${SIDECAR_NODE_PORT}"
+
+    case "$scheme" in
+    vless)
+        SIDECAR_NODE_METHOD=$(_sidecar_query_get "$query" encryption none) || return
+        ;;
+    vmess)
+        SIDECAR_NODE_METHOD=$(_sidecar_query_get "$query" encryption auto) || return
+        ;;
+    trojan)
+        # Trojan 分享链接省略 security 时按行业通用约定使用 TLS。
+        [[ "&$query&" == *'&security='* ]] || SIDECAR_NODE_SECURITY=tls
+        SIDECAR_NODE_PASSWORD=$userinfo
+        SIDECAR_NODE_METHOD=$SIDECAR_NODE_SECURITY
+        ;;
+    esac
+}
+
+_sidecar_parse_vmess_legacy() {
+    local uri=$1 body json
+    body=${uri#vmess://}
+    body=${body%%#*}
+    json=$(_sidecar_b64_decode "$body") || {
+        _errorcat 'VMess Base64 解码失败'
+        return 1
+    }
+    printf '%s' "$json" | "$BIN_YQ" -p=json -e 'type == "!!map"' >/dev/null 2>&1 || {
+        _errorcat 'VMess 分享链接中的 JSON 无效'
+        return 1
+    }
+    SIDECAR_NODE_PROTOCOL=vmess
+    SIDECAR_NODE_NAME=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.ps // ""')
+    SIDECAR_NODE_SERVER=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.add // ""')
+    SIDECAR_NODE_PORT=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.port // ""')
+    SIDECAR_NODE_USER=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.id // ""')
+    SIDECAR_NODE_ALTER_ID=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.aid // 0')
+    SIDECAR_NODE_METHOD=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.scy // "auto"')
+    SIDECAR_NODE_TRANSPORT=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.net // "tcp"')
+    SIDECAR_NODE_SECURITY=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.tls // "none"')
+    [ -n "$SIDECAR_NODE_SECURITY" ] || SIDECAR_NODE_SECURITY=none
+    SIDECAR_NODE_SNI=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.sni // ""')
+    SIDECAR_NODE_FP=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.fp // ""')
+    SIDECAR_NODE_ALPN=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.alpn // ""')
+    SIDECAR_NODE_HOST=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.host // ""')
+    SIDECAR_NODE_PATH=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.path // ""')
+    SIDECAR_NODE_HEADER_TYPE=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.type // ""')
+    SIDECAR_NODE_SERVICE_NAME=$SIDECAR_NODE_PATH
+    SIDECAR_NODE_AUTHORITY=$SIDECAR_NODE_HOST
+    SIDECAR_NODE_INSECURE=$(printf '%s' "$json" | "$BIN_YQ" -p=json -r '.allowInsecure // false')
+    _sidecar_parse_host_port "${SIDECAR_NODE_SERVER}:${SIDECAR_NODE_PORT}" VMess || return
+    [ -n "$SIDECAR_NODE_USER" ] || {
+        _errorcat 'VMess 链接缺少用户 ID'
+        return 1
+    }
+    [[ "$SIDECAR_NODE_ALTER_ID" =~ ^[0-9]+$ ]] || {
+        _errorcat 'VMess alterId 无效'
+        return 1
+    }
+    [ -n "$SIDECAR_NODE_NAME" ] ||
+        SIDECAR_NODE_NAME="${SIDECAR_NODE_SERVER}:${SIDECAR_NODE_PORT}"
+}
+
+_sidecar_parse_uri() {
+    local uri=$1
+    _sidecar_reset_node_vars
+    case "$uri" in
+    ss://*) _sidecar_parse_ss_uri "$uri" ;;
+    vless://*) _sidecar_parse_standard_uri "$uri" vless ;;
+    trojan://*) _sidecar_parse_standard_uri "$uri" trojan ;;
+    vmess://*)
+        if [[ "${uri#vmess://}" == *@* ]]; then
+            _sidecar_parse_standard_uri "$uri" vmess
+        else
+            _sidecar_parse_vmess_legacy "$uri"
+        fi
+        ;;
+    *)
+        _errorcat '不支持的节点链接；当前支持 ss://、vless://、vmess://、trojan://'
+        return 1
+        ;;
+    esac || return
+
+    SIDECAR_NODE_NAME=$(printf '%s' "$SIDECAR_NODE_NAME" | _sidecar_clean_label)
+    [ -n "$SIDECAR_NODE_NAME" ] ||
+        SIDECAR_NODE_NAME="${SIDECAR_NODE_SERVER}:${SIDECAR_NODE_PORT}"
+
+    case "$SIDECAR_NODE_TRANSPORT" in
+    '' | tcp | raw) SIDECAR_NODE_TRANSPORT=tcp ;;
+    ws | websocket) SIDECAR_NODE_TRANSPORT=ws ;;
+    grpc | httpupgrade | xhttp) ;;
+    http | h2)
+        # Xray 26 已移除旧 HTTP transport；分享链接中的 HTTP/H2 兼容映射到
+        # XHTTP stream-one，保留其 HTTP/2/3 单流语义。
+        SIDECAR_NODE_TRANSPORT=xhttp
+        [ -n "$SIDECAR_NODE_MODE" ] || SIDECAR_NODE_MODE=stream-one
+        ;;
+    kcp | mkcp) SIDECAR_NODE_TRANSPORT=kcp ;;
+    *)
+        _errorcat "暂不支持传输方式：$SIDECAR_NODE_TRANSPORT"
+        return 1
+        ;;
+    esac
+    case "$SIDECAR_NODE_SECURITY" in
+    '' | none) SIDECAR_NODE_SECURITY=none ;;
+    tls | reality) ;;
+    xtls) SIDECAR_NODE_SECURITY=tls ;;
+    *)
+        _errorcat "暂不支持传输安全：$SIDECAR_NODE_SECURITY"
+        return 1
+        ;;
+    esac
+    if [ -n "$SIDECAR_NODE_EXTRA" ]; then
+        printf '%s' "$SIDECAR_NODE_EXTRA" |
+            "$BIN_YQ" -p=json -e 'type == "!!map"' >/dev/null 2>&1 || {
+            _errorcat '节点链接中的 extra 不是有效 JSON 对象'
+            return 1
+        }
+    fi
+}
+
+_sidecar_write_config() {
+    local target=$1 listen=$2 port=$3 outbound
+    outbound="${target}.outbound.json"
+    : "${SIDECAR_NODE_TRANSPORT:=tcp}"
+    : "${SIDECAR_NODE_SECURITY:=none}"
+    : "${SIDECAR_NODE_PROTOCOL:=shadowsocks}"
+    local path=${SIDECAR_NODE_PATH:-/}
+    [ -n "$path" ] || path=/
+
+    case "$SIDECAR_NODE_PROTOCOL" in
+    shadowsocks)
+        SIDECAR_SERVER=$SIDECAR_NODE_SERVER SIDECAR_SERVER_PORT=$SIDECAR_NODE_PORT \
+            SIDECAR_METHOD=$SIDECAR_NODE_METHOD SIDECAR_PASSWORD=$SIDECAR_NODE_PASSWORD \
+            "$BIN_YQ" -n -o=json '{
+              "tag": "proxy", "protocol": "shadowsocks",
+              "settings": {"servers": [{
+                "address": strenv(SIDECAR_SERVER), "port": (strenv(SIDECAR_SERVER_PORT) | tonumber),
+                "method": strenv(SIDECAR_METHOD), "password": strenv(SIDECAR_PASSWORD), "level": 1
+              }]}, "mux": {"enabled": false, "concurrency": -1}
+            }' >"$outbound"
+        ;;
+    vless)
+        SIDECAR_SERVER=$SIDECAR_NODE_SERVER SIDECAR_SERVER_PORT=$SIDECAR_NODE_PORT \
+            SIDECAR_USER=$SIDECAR_NODE_USER SIDECAR_METHOD=$SIDECAR_NODE_METHOD \
+            SIDECAR_FLOW=$SIDECAR_NODE_FLOW "$BIN_YQ" -n -o=json '{
+              "tag": "proxy", "protocol": "vless",
+              "settings": {"vnext": [{
+                "address": strenv(SIDECAR_SERVER), "port": (strenv(SIDECAR_SERVER_PORT) | tonumber),
+                "users": [{"id": strenv(SIDECAR_USER), "encryption": strenv(SIDECAR_METHOD),
+                  "flow": strenv(SIDECAR_FLOW), "level": 0}]
+              }]}, "mux": {"enabled": false, "concurrency": -1}
+            }' >"$outbound"
+        ;;
+    vmess)
+        SIDECAR_SERVER=$SIDECAR_NODE_SERVER SIDECAR_SERVER_PORT=$SIDECAR_NODE_PORT \
+            SIDECAR_USER=$SIDECAR_NODE_USER SIDECAR_METHOD=$SIDECAR_NODE_METHOD \
+            SIDECAR_ALTER_ID=${SIDECAR_NODE_ALTER_ID:-0} \
+            "$BIN_YQ" -n -o=json '{
+              "tag": "proxy", "protocol": "vmess",
+              "settings": {"vnext": [{
+                "address": strenv(SIDECAR_SERVER), "port": (strenv(SIDECAR_SERVER_PORT) | tonumber),
+                "users": [{"id": strenv(SIDECAR_USER), "security": strenv(SIDECAR_METHOD),
+                  "alterId": (strenv(SIDECAR_ALTER_ID) | tonumber), "level": 0}]
+              }]}, "mux": {"enabled": false, "concurrency": -1}
+            }' >"$outbound"
+        ;;
+    trojan)
+        SIDECAR_SERVER=$SIDECAR_NODE_SERVER SIDECAR_SERVER_PORT=$SIDECAR_NODE_PORT \
+            SIDECAR_PASSWORD=$SIDECAR_NODE_PASSWORD "$BIN_YQ" -n -o=json '{
+              "tag": "proxy", "protocol": "trojan",
+              "settings": {"servers": [{
+                "address": strenv(SIDECAR_SERVER), "port": (strenv(SIDECAR_SERVER_PORT) | tonumber),
+                "password": strenv(SIDECAR_PASSWORD), "level": 0
+              }]}, "mux": {"enabled": false, "concurrency": -1}
+            }' >"$outbound"
+        ;;
+    *) rm -f "$outbound"; _errorcat "无法生成协议配置：$SIDECAR_NODE_PROTOCOL"; return 1 ;;
+    esac || { rm -f "$outbound"; return 1; }
+
+    SIDECAR_TRANSPORT=$SIDECAR_NODE_TRANSPORT SIDECAR_SECURITY=$SIDECAR_NODE_SECURITY \
+        "$BIN_YQ" -i -o=json '.streamSettings = {
+          "network": strenv(SIDECAR_TRANSPORT), "security": strenv(SIDECAR_SECURITY)
+        }' "$outbound" || { rm -f "$outbound"; return 1; }
+    case "$SIDECAR_NODE_TRANSPORT" in
+    ws)
+        SIDECAR_PATH=$path SIDECAR_HOST=$SIDECAR_NODE_HOST "$BIN_YQ" -i -o=json \
+            '.streamSettings.wsSettings = {"path": strenv(SIDECAR_PATH),
+              "headers": {"Host": strenv(SIDECAR_HOST)}}' "$outbound"
+        ;;
+    grpc)
+        SIDECAR_SERVICE_NAME=$SIDECAR_NODE_SERVICE_NAME SIDECAR_AUTHORITY=$SIDECAR_NODE_AUTHORITY \
+            "$BIN_YQ" -i -o=json '.streamSettings.grpcSettings = {
+              "serviceName": strenv(SIDECAR_SERVICE_NAME), "authority": strenv(SIDECAR_AUTHORITY)
+            }' "$outbound"
+        ;;
+    httpupgrade)
+        SIDECAR_PATH=$path SIDECAR_HOST=$SIDECAR_NODE_HOST "$BIN_YQ" -i -o=json \
+            '.streamSettings.httpupgradeSettings = {"path": strenv(SIDECAR_PATH),
+              "host": strenv(SIDECAR_HOST)}' "$outbound"
+        ;;
+    xhttp)
+        SIDECAR_PATH=$path SIDECAR_HOST=$SIDECAR_NODE_HOST SIDECAR_MODE=$SIDECAR_NODE_MODE \
+            "$BIN_YQ" -i -o=json '.streamSettings.xhttpSettings = {
+              "path": strenv(SIDECAR_PATH), "host": strenv(SIDECAR_HOST), "mode": strenv(SIDECAR_MODE)
+            }' "$outbound" || { rm -f "$outbound"; return 1; }
+        if [ -n "$SIDECAR_NODE_EXTRA" ]; then
+            SIDECAR_EXTRA=$SIDECAR_NODE_EXTRA "$BIN_YQ" -i -o=json \
+                '.streamSettings.xhttpSettings.extra = (strenv(SIDECAR_EXTRA) | from_json)' "$outbound"
+        fi
+        ;;
+    kcp)
+        # Xray 26 把旧 mKCP seed/header 迁移到了 FinalMask。分享链接仍沿用
+        # 原字段，这里做等价转换，避免生成已被核心删除的 kcpSettings 字段。
+        "$BIN_YQ" -i -o=json '.streamSettings.kcpSettings = {}' "$outbound" || {
+            rm -f "$outbound"
+            return 1
+        }
+        if [ -n "$SIDECAR_NODE_SEED" ]; then
+            SIDECAR_SEED=$SIDECAR_NODE_SEED "$BIN_YQ" -i -o=json \
+                '.streamSettings.finalmask.udp = [{"type": "mkcp-aes128gcm",
+                  "settings": {"password": strenv(SIDECAR_SEED)}}]' "$outbound"
+        else
+            "$BIN_YQ" -i -o=json '.streamSettings.finalmask.udp = [
+              {"type": "mkcp-original", "settings": {}}]' "$outbound"
+        fi || { rm -f "$outbound"; return 1; }
+        local kcp_header=${SIDECAR_NODE_HEADER_TYPE,,}
+        case "$kcp_header" in
+        '' | none) ;;
+        wechat-video) kcp_header=wechat ;;
+        srtp | utp | wechat | dtls | wireguard | dns) ;;
+        *) _errorcat "不支持的 mKCP headerType：$SIDECAR_NODE_HEADER_TYPE"; rm -f "$outbound"; return 1 ;;
+        esac
+        if [ -n "$kcp_header" ] && [ "$kcp_header" != none ]; then
+            SIDECAR_HEADER_MASK="header-$kcp_header" "$BIN_YQ" -i -o=json \
+                '.streamSettings.finalmask.udp += [{"type": strenv(SIDECAR_HEADER_MASK), "settings": {}}]' \
+                "$outbound"
+        fi
+        ;;
+    tcp)
+        if [ -n "$SIDECAR_NODE_HEADER_TYPE" ] && [ "$SIDECAR_NODE_HEADER_TYPE" != none ]; then
+            SIDECAR_HEADER_TYPE=$SIDECAR_NODE_HEADER_TYPE "$BIN_YQ" -i -o=json \
+                '.streamSettings.tcpSettings = {"header": {"type": strenv(SIDECAR_HEADER_TYPE)}}' "$outbound"
+        fi
+        ;;
+    esac || { rm -f "$outbound"; return 1; }
+
+    case "$SIDECAR_NODE_SECURITY" in
+    tls)
+        SIDECAR_SNI=$SIDECAR_NODE_SNI SIDECAR_FP=$SIDECAR_NODE_FP \
+            SIDECAR_INSECURE=$SIDECAR_NODE_INSECURE "$BIN_YQ" -i -o=json \
+            '.streamSettings.tlsSettings = {"serverName": strenv(SIDECAR_SNI),
+              "fingerprint": strenv(SIDECAR_FP),
+              "allowInsecure": (strenv(SIDECAR_INSECURE) == "true" or strenv(SIDECAR_INSECURE) == "1")}' \
+            "$outbound" || { rm -f "$outbound"; return 1; }
+        if [ -n "$SIDECAR_NODE_ALPN" ]; then
+            SIDECAR_ALPN=$SIDECAR_NODE_ALPN "$BIN_YQ" -i -o=json \
+                '.streamSettings.tlsSettings.alpn = (strenv(SIDECAR_ALPN) | split(","))' "$outbound"
+        fi
+        ;;
+    reality)
+        SIDECAR_SNI=$SIDECAR_NODE_SNI SIDECAR_FP=${SIDECAR_NODE_FP:-chrome} \
+            SIDECAR_PBK=$SIDECAR_NODE_PBK SIDECAR_SID=$SIDECAR_NODE_SID \
+            SIDECAR_SPX=$SIDECAR_NODE_SPX "$BIN_YQ" -i -o=json \
+            '.streamSettings.realitySettings = {
+              "serverName": strenv(SIDECAR_SNI), "fingerprint": strenv(SIDECAR_FP),
+              "publicKey": strenv(SIDECAR_PBK), "shortId": strenv(SIDECAR_SID),
+              "spiderX": strenv(SIDECAR_SPX)
+            }' "$outbound"
+        ;;
+    esac || { rm -f "$outbound"; return 1; }
+
+    SIDECAR_LISTEN=$listen SIDECAR_PORT=$port OUTBOUND_FILE=$outbound \
+        "$BIN_YQ" -n -o=json '
+          load(strenv(OUTBOUND_FILE)) as $proxy |
           {
             "log": {"loglevel": "warning"},
             "inbounds": [{
-              "tag": "mixed-in",
-              "listen": strenv(SIDECAR_LISTEN),
-              "port": (strenv(SIDECAR_PORT) | tonumber),
-              "protocol": "mixed",
+              "tag": "mixed-in", "listen": strenv(SIDECAR_LISTEN),
+              "port": (strenv(SIDECAR_PORT) | tonumber), "protocol": "mixed",
               "sniffing": {"enabled": true, "destOverride": ["http", "tls"], "routeOnly": false},
               "settings": {"auth": "noauth", "udp": true, "allowTransparent": false}
             }],
-            "outbounds": [{
-              "tag": "proxy",
-              "protocol": "shadowsocks",
-              "settings": {"servers": [{
-                "address": strenv(SIDECAR_SERVER),
-                "port": (strenv(SIDECAR_SERVER_PORT) | tonumber),
-                "method": strenv(SIDECAR_METHOD),
-                "password": strenv(SIDECAR_PASSWORD),
-                "level": 1
-              }]},
-              "streamSettings": {"network": "tcp"},
-              "mux": {"enabled": false, "concurrency": -1}
-            }, {"tag": "direct", "protocol": "freedom"}, {"tag": "block", "protocol": "blackhole"}],
+            "outbounds": [$proxy, {"tag": "direct", "protocol": "freedom"},
+              {"tag": "block", "protocol": "blackhole"}],
             "routing": {"domainStrategy": "AsIs", "rules": []}
           }
         ' >"$target"
+    local rc=$?
+    rm -f "$outbound"
+    return "$rc"
+}
+
+# 兼容旧脚本/测试调用名。
+_sidecar_write_ss_config() {
+    _sidecar_write_config "$@"
 }
 
 _sidecar_import_locked() {
     local uri=$1 listen port tmp backup='' was_active=false
     _sidecar_init_files
-    _sidecar_parse_ss_uri "$uri" || return
+    _sidecar_parse_uri "$uri" || return
     listen=$(_sidecar_state_get listen)
     port=$(_sidecar_state_get port)
-    tmp=$(mktemp "${CLASH_SIDECAR_DIR}/.config.XXXXXX") || return
-    _sidecar_write_ss_config "$tmp" "$listen" "$port" || {
+    # Xray 26 依据扩展名识别配置格式，临时文件也必须保留 .json 后缀。
+    tmp=$(mktemp "${CLASH_SIDECAR_DIR}/.config.XXXXXX.json") || return
+    _sidecar_write_config "$tmp" "$listen" "$port" || {
         rm -f "$tmp"
         return 1
     }
@@ -466,12 +868,15 @@ _sidecar_import_locked() {
     fi
     [ -z "$backup" ] || rm -f "$backup"
     _sidecar_state_set node-name "$SIDECAR_NODE_NAME"
+    _sidecar_state_set protocol "$SIDECAR_NODE_PROTOCOL"
     _sidecar_state_set server "$SIDECAR_NODE_SERVER"
     _sidecar_state_set_num server-port "$SIDECAR_NODE_PORT"
     _sidecar_state_set method "$SIDECAR_NODE_METHOD"
+    _sidecar_state_set transport "$SIDECAR_NODE_TRANSPORT"
+    _sidecar_state_set security "$SIDECAR_NODE_SECURITY"
     _sidecar_state_set updated-at "$(date '+%Y-%m-%d %H:%M:%S')"
     _sidecar_state_set last-error ''
-    _okcat '✅' "旁代理节点已导入：$SIDECAR_NODE_NAME"
+    _okcat '✅' "旁代理节点已导入：$SIDECAR_NODE_NAME（${SIDECAR_NODE_PROTOCOL}/${SIDECAR_NODE_TRANSPORT}）"
 }
 
 _sidecar_start_locked() {
@@ -487,12 +892,12 @@ _sidecar_start_locked() {
         return 1
     }
     [ -s "$CLASH_SIDECAR_CONFIG" ] || {
-        _errorcat '尚未导入旁代理节点：clashctl sidecar import <ss://...>'
+        _errorcat '尚未导入旁代理节点：clashctl sidecar import <分享链接>'
         return 1
     }
     [ -x "$BIN_XRAY" ] || {
-        _okcat 'ℹ️' '首次使用，安装已验证的 Xray 核心…'
-        _sidecar_core_update_locked "${CLASHCTL_XRAY_VERSION:-v25.5.16}" || return
+        _okcat 'ℹ️' '首次使用，安装并校验 Xray 稳定版核心…'
+        _sidecar_core_update_locked "${CLASHCTL_XRAY_VERSION:-latest}" || return
     }
     "$BIN_XRAY" run -test -config "$CLASH_SIDECAR_CONFIG" >/dev/null || {
         _errorcat 'Xray 配置校验失败'
@@ -549,7 +954,7 @@ _sidecar_set_port_locked() {
         _okcat '✅' "旁代理端口已设置：$port"
         return 0
     fi
-    tmp=$(mktemp "${CLASH_SIDECAR_DIR}/.config.XXXXXX") || return
+    tmp=$(mktemp "${CLASH_SIDECAR_DIR}/.config.XXXXXX.json") || return
     SIDECAR_PORT=$port "$BIN_YQ" -p=json -o=json \
         '.inbounds[0].port = (strenv(SIDECAR_PORT) | tonumber)' \
         "$CLASH_SIDECAR_CONFIG" >"$tmp" || { rm -f "$tmp"; return 1; }
@@ -601,7 +1006,7 @@ _sidecar_test() {
 
 _sidecar_status() {
     local active=停止 enabled core listen port listener port_state=未监听 main=停止 tun=关闭 vg=关闭
-    local node server server_port method last_test last_ip last_error
+    local node protocol server server_port method transport security last_test last_ip last_error
     _sidecar_init_files
     _sidecar_is_active && active=运行中
     [ "$(_sidecar_state_get enabled)" = true ] && enabled=开启 || enabled=关闭
@@ -620,9 +1025,12 @@ _sidecar_status() {
         fi
     fi
     node=$(_sidecar_state_get node-name)
+    protocol=$(_sidecar_state_get protocol)
     server=$(_sidecar_state_get server)
     server_port=$(_sidecar_state_get server-port)
     method=$(_sidecar_state_get method)
+    transport=$(_sidecar_state_get transport)
+    security=$(_sidecar_state_get security)
     last_test=$(_sidecar_state_get last-test-at)
     last_ip=$(_sidecar_state_get last-test-ip)
     last_error=$(_sidecar_state_get last-error)
@@ -634,8 +1042,10 @@ Xray 旁代理状态
   监听地址：${listen:-0.0.0.0}:${port:-10112}
   端口状态：$port_state
   当前节点：${node:-未导入}
+  节点协议：${protocol:-Shadowsocks（旧配置）}
   节点地址：${server:-未设置}$([ -n "$server" ] && printf ':%s' "$server_port")
-  加密方法：${method:-未设置}
+  传输方式：${transport:-tcp}$([ -n "$security" ] && printf ' + %s' "$security")
+  协议参数：${method:-未设置}
   主 Mihomo：$main
   主 TUN：$tun
   VPNGate：$vg
