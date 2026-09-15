@@ -67,10 +67,12 @@ EOF
 Description=Periodically refresh VPNGate nodes for clashctl
 
 [Timer]
-OnBootSec=${boot_delay}min
-OnUnitActiveSec=${interval}min
+# 两个触发器都使用相对 timer 生命周期的单调时钟：无论是在开机时，
+# 还是 VPNGate 运行中途恢复/重启 timer，都会先安排一次执行；之后从
+# oneshot 服务完成的时间开始计算下一次，避免 timer 进入 active (elapsed)。
+OnActiveSec=${boot_delay}min
+OnUnitInactiveSec=${interval}min
 AccuracySec=1min
-Persistent=true
 Unit=${VPNGATE_SCHEDULE_SERVICE}
 
 [Install]
@@ -206,7 +208,10 @@ _vpngate_schedule_status() {
         systemctl is-enabled --quiet "$VPNGATE_SCHEDULE_TIMER" 2>/dev/null && enabled=是
         if [ "$active" = 运行中 ]; then
             next=$(_vpngate_schedule_next)
-            [ -n "$next" ] || next='等待 systemd 计算'
+            if [ -z "$next" ]; then
+                active='异常（无下次执行）'
+                next='未安排；请重启定时更新'
+            fi
         fi
     fi
     if [ "$active" != 运行中 ] && [ "$configured" = true ] &&

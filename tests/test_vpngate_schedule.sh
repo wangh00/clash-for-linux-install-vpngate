@@ -26,6 +26,26 @@ systemctl() {
 export -f systemctl
 
 . "$ROOT/scripts/lib/vpngate_schedule.sh"
+
+# timer 在 VPNGate 运行中途恢复时，必须从 timer 本身的激活时间计算
+# 首次执行。OnBootSec 在系统已启动较久时会直接 elapsed，不会产生
+# 下一次触发时间。
+TMP_DIR=$(mktemp -d)
+trap 'rm -rf "$TMP_DIR"' EXIT
+CLASH_VPNGATE_DIR="$TMP_DIR/vpngate"
+CLASH_VPNGATE_SCHEDULE_RUNNER="$CLASH_VPNGATE_DIR/scheduled-update.sh"
+VPNGATE_SCHEDULE_SERVICE_PATH="$TMP_DIR/$VPNGATE_SCHEDULE_SERVICE"
+VPNGATE_SCHEDULE_TIMER_PATH="$TMP_DIR/$VPNGATE_SCHEDULE_TIMER"
+CLASHCTL_HOME="$ROOT"
+CLASHCTL_KERNEL=mihomo
+_vpngate_schedule_require_systemd() { :; }
+_vpngate_schedule_write_units 60
+grep -qx 'OnActiveSec=5min' "$VPNGATE_SCHEDULE_TIMER_PATH"
+grep -qx 'OnUnitInactiveSec=60min' "$VPNGATE_SCHEDULE_TIMER_PATH"
+! grep -q '^OnBootSec=' "$VPNGATE_SCHEDULE_TIMER_PATH"
+! grep -q '^OnUnitActiveSec=' "$VPNGATE_SCHEDULE_TIMER_PATH"
+CALLS=''
+
 _vpngate_schedule_write_units() { WRITES=$((WRITES + 1)); }
 
 if _vpngate_schedule_start 60 2>/dev/null; then
