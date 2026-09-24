@@ -304,6 +304,160 @@ _vpngate_restore_route_mode() {
         _node_apply "$VPNGATE_GROUP_AUTO" "$target"
 }
 
+_vpngate_overlay_has_proxy() {
+    local overlay=$1 name=$2
+    PROXY_NAME="$name" "$BIN_YQ" -e \
+        '.proxies.append[] | select(.name == strenv(PROXY_NAME))' \
+        "$overlay" >/dev/null 2>&1
+}
+
+# 新 API 列表不再包含当前出口时，先把旧代理留在过渡配置中；它不加入 AUTO
+# 候选，因此 AUTO 不会继续把已下榜的节点当作新候选。成功切换后的下一次
+# 节点列表变更会自然清理这条过渡代理。
+_vpngate_overlay_retain_proxy() {
+    local old_overlay=$1 new_overlay=$2 name=$3 group=$4 work_dir=$5
+    local proxy_file="${work_dir}/retained-proxy.yaml"
+    PROXY_NAME="$name" "$BIN_YQ" -e \
+        '.proxies.append[] | select(.name == strenv(PROXY_NAME))' \
+        "$old_overlay" >"$proxy_file" 2>/dev/null || return 1
+    [ -s "$proxy_file" ] || return 1
+    PROXY_FILE="$proxy_file" PROXY_NAME="$name" VISIBLE_GROUP="$group" \
+        "$BIN_YQ" -i '
+          .proxies.append += [load(strenv(PROXY_FILE))] |
+          (."proxy-groups".append[] | select(.name == strenv(VISIBLE_GROUP)).proxies) += [strenv(PROXY_NAME)]
+        ' "$new_overlay" || return 1
+    _vpngate_overlay_has_proxy "$new_overlay" "$name"
+}
+
+# 只探测隐藏 AUTO 组中排名靠前的少量新候选，分批最多 3 路并发。
+# stdout 仅返回第一批中延迟最低的可用节点名；日志由调用方记录。
+_vpngate_probe_auto_candidates() {
+    local auto_group=$1 prefix timeout_ms name delay result candidate best best_delay
+    local url=${CLASHCTL_VPNGATE_DELAY_URL:-https://cp.cloudflare.com}
+    local limit=${CLASHCTL_VPNGATE_UPDATE_PROBE_LIMIT:-6}
+    local concurrency=${CLASHCTL_VPNGATE_UPDATE_PROBE_CONCURRENCY:-3}
+    local i j
+    local candidates=() batch=()
+    case "$auto_group" in
+    "$VPNGATE_GROUP_DIRECT_AUTO") prefix='[直连] VPNGate-'; timeout_ms=15000 ;;
+    "$VPNGATE_GROUP_FRONT_AUTO") prefix='[前置] VPNGate-'; timeout_ms=20000 ;;
+    *) return 1 ;;
+    esac
+    [[ "$limit" =~ ^[1-9][0-9]*$ ]] || limit=6
+    ((limit > 20)) && limit=20
+    [[ "$concurrency" =~ ^[1-9][0-9]*$ ]] || concurrency=3
+    ((concurrency > 3)) && concurrency=3
+    while IFS= read -r name; do
+        [[ "$name" == "$prefix"* ]] && candidates+=("$name")
+    done < <(_node_members "$auto_group")
+    [ ${#candidates[@]} -gt 0 ] || return 1
+
+    for ((i = 0; i < ${#candidates[@]} && i < limit; i += concurrency)); do
+        batch=()
+        for ((j = i; j < i + concurrency && j < ${#candidates[@]} && j < limit; j++)); do
+            batch+=("${candidates[$j]}")
+        done
+        result=$(CLASHCTL_NODE_DELAY_CONCURRENCY="$concurrency" \
+            _node_delay_member_rows "$url" "$timeout_ms" "${batch[@]}")
+        best='' best_delay=''
+        while IFS=$'\t' read -r candidate delay; do
+            if [[ "$delay" =~ ^[1-9][0-9]*$ ]] &&
+                { [ -z "$best_delay" ] || ((delay < best_delay)); }; then
+                best=$candidate
+                best_delay=$delay
+            fi
+        done <<<"$result"
+        if [ -n "$best" ]; then
+            printf '%s\n' "$best"
+            return 0
+        fi
+    done
+    return 1
+}
+
+_vpngate_update_rollback() {
+    local transaction=$1 old_direct=$2 old_front=$3 old_route_mode=$4 old_route_type=$5
+    local reload_needed=${6:-true} failed=0
+    cp "$transaction/direct.yaml" "$CLASH_VPNGATE_NODES_DIRECT" || return 1
+    cp "$transaction/front.yaml" "$CLASH_VPNGATE_NODES_FRONT" || return 1
+    cp "$transaction/overlay.yaml" "$CLASH_VPNGATE_OVERLAY" || return 1
+    if [ -e "$transaction/servers.csv" ]; then
+        cp "$transaction/servers.csv" "$CLASH_VPNGATE_API_RAW" || return 1
+    else
+        rm -f "$CLASH_VPNGATE_API_RAW"
+    fi
+    if [ "$reload_needed" = true ]; then
+        _merge_config_reload >/dev/null 2>&1 || return 1
+        _vpngate_restore_selections "$old_direct" "$old_front" >/dev/null 2>&1 || failed=1
+        if [[ "$old_route_type" == *Selector* ]]; then
+            _vpngate_restore_route_mode "$old_route_mode" "$old_route_type" >/dev/null 2>&1 || failed=1
+        fi
+    fi
+    return "$failed"
+}
+
+# 先证明当前真实出口可用；若旧出口被暂留或更新后不通，则小并发预测候选。
+# AUTO 实际出口不通时临时固定到已测通叶子，避免继续等待周期健康检查。
+_vpngate_handoff_after_reload() {
+    local active_group=$1 auto_group=$2 old_leaf=$3 retained=$4
+    local old_route_mode=${5:-} candidate current
+    VPNGATE_HANDOFF_SELECTION=preserved
+    VPNGATE_HANDOFF_ERROR=''
+    if [ "$retained" != true ] && _vpngate_test_current_route >/dev/null 2>&1; then
+        return 0
+    fi
+    [ -n "$active_group" ] && [ -n "$auto_group" ] || {
+        VPNGATE_HANDOFF_ERROR='无法确定当前 VPNGate 出口组'
+        return 1
+    }
+    if [ "$retained" = true ]; then
+        current=$(_node_now "$active_group" 2>/dev/null)
+        [ "$current" = "$old_leaf" ] || _node_apply "$active_group" "$old_leaf" >/dev/null || {
+            VPNGATE_HANDOFF_ERROR='无法暂留旧出口节点'
+            return 1
+        }
+        if [ "$old_route_mode" = "$VPNGATE_GROUP_SMART_AUTO" ]; then
+            _node_apply "$VPNGATE_GROUP_AUTO" "$active_group" >/dev/null || {
+                VPNGATE_HANDOFF_ERROR='无法在过渡期间固定旧出口链路'
+                return 1
+            }
+        fi
+    fi
+    candidate=$(_vpngate_probe_auto_candidates "$auto_group") || {
+        VPNGATE_HANDOFF_ERROR='首批新 AUTO 候选均未通过测速'
+        return 1
+    }
+    [ -n "$candidate" ] || {
+        VPNGATE_HANDOFF_ERROR='新 AUTO 候选列表为空'
+        return 1
+    }
+
+    _node_apply "$active_group" "$auto_group" >/dev/null || {
+        VPNGATE_HANDOFF_ERROR='切换到 AUTO 失败'
+        return 1
+    }
+    if [ "$old_route_mode" = "$VPNGATE_GROUP_SMART_AUTO" ]; then
+        _node_apply "$VPNGATE_GROUP_AUTO" "$VPNGATE_GROUP_SMART_AUTO" >/dev/null || return 1
+    fi
+    if _vpngate_test_current_route >/dev/null 2>&1; then
+        VPNGATE_HANDOFF_SELECTION=auto
+        return 0
+    fi
+    _node_apply "$active_group" "$candidate" >/dev/null || {
+        VPNGATE_HANDOFF_ERROR='AUTO 出口不通且无法固定已测通节点'
+        return 1
+    }
+    if [ "$old_route_mode" = "$VPNGATE_GROUP_SMART_AUTO" ]; then
+        _node_apply "$VPNGATE_GROUP_AUTO" "$active_group" >/dev/null || return 1
+    fi
+    if _vpngate_test_current_route >/dev/null 2>&1; then
+        VPNGATE_HANDOFF_SELECTION=pinned
+        return 0
+    fi
+    VPNGATE_HANDOFF_ERROR='AUTO 和已测通节点的真实出口验证均失败'
+    return 1
+}
+
 _vpngate_update_locked() {
     _vpngate_init_files
     _vpngate_resolve_options
@@ -326,17 +480,31 @@ _vpngate_update_locked() {
         return 1
     }
 
-    local old_direct old_front old_route_mode old_route_type transaction now
+    local old_direct old_front stage_direct stage_front old_route_mode old_route_type old_leaf
+    local active_group='' auto_group='' retained=false stage_ok=true reload_attempted=false
+    local transaction now failure_reason
     old_direct=$(_node_now "$VPNGATE_GROUP_DIRECT" 2>/dev/null)
     old_front=$(_node_now "$VPNGATE_GROUP_FRONT" 2>/dev/null)
     old_route_mode=$(_node_now "$VPNGATE_GROUP_AUTO" 2>/dev/null)
     old_route_type=$(_node_group_json "$VPNGATE_GROUP_AUTO" 2>/dev/null |
         "$BIN_YQ" -p=json '.type // ""' 2>/dev/null)
+    old_leaf=$(_vpngate_route_leaf)
+    case "$old_leaf" in
+    "[直连] VPNGate-"*) active_group=$VPNGATE_GROUP_DIRECT; auto_group=$VPNGATE_GROUP_DIRECT_AUTO ;;
+    "[前置] VPNGate-"*) active_group=$VPNGATE_GROUP_FRONT; auto_group=$VPNGATE_GROUP_FRONT_AUTO ;;
+    esac
     transaction=$(mktemp -d "${CLASH_VPNGATE_DIR}/.update-backup.XXXXXX") || return 1
-    cp "$CLASH_VPNGATE_NODES_DIRECT" "$transaction/direct.yaml"
-    cp "$CLASH_VPNGATE_NODES_FRONT" "$transaction/front.yaml"
-    cp "$CLASH_VPNGATE_OVERLAY" "$transaction/overlay.yaml"
-    [ ! -e "$CLASH_VPNGATE_API_RAW" ] || cp "$CLASH_VPNGATE_API_RAW" "$transaction/servers.csv"
+    if ! cp "$CLASH_VPNGATE_NODES_DIRECT" "$transaction/direct.yaml" ||
+        ! cp "$CLASH_VPNGATE_NODES_FRONT" "$transaction/front.yaml" ||
+        ! cp "$CLASH_VPNGATE_OVERLAY" "$transaction/overlay.yaml" ||
+        { [ -e "$CLASH_VPNGATE_API_RAW" ] &&
+            ! cp "$CLASH_VPNGATE_API_RAW" "$transaction/servers.csv"; }; then
+        rm -rf "$transaction"
+        _vpngate_state_set last-update-result failed
+        _vpngate_state_set last-update-error '无法备份更新前配置'
+        _errorcat '无法备份更新前配置，已停止更新'
+        return 1
+    fi
 
     now=$(date '+%Y-%m-%d %H:%M:%S')
     _vpngate_state_set checked-at "$now"
@@ -362,41 +530,81 @@ _vpngate_update_locked() {
     fi
 
     CLASHCTL_CONFIG_APPLY_METHOD=''
-    if ! _vpngate_write_overlay full "$VPNGATE_FRONT" || ! _merge_config_reload; then
-        cp "$transaction/direct.yaml" "$CLASH_VPNGATE_NODES_DIRECT"
-        cp "$transaction/front.yaml" "$CLASH_VPNGATE_NODES_FRONT"
-        cp "$transaction/overlay.yaml" "$CLASH_VPNGATE_OVERLAY"
-        if [ -e "$transaction/servers.csv" ]; then
-            cp "$transaction/servers.csv" "$CLASH_VPNGATE_API_RAW"
+    _vpngate_write_overlay full "$VPNGATE_FRONT" || stage_ok=false
+    if [ "$stage_ok" = true ] && [ -n "$active_group" ] &&
+        ! _vpngate_overlay_has_proxy "$CLASH_VPNGATE_OVERLAY" "$old_leaf"; then
+        if _vpngate_overlay_retain_proxy "$transaction/overlay.yaml" \
+            "$CLASH_VPNGATE_OVERLAY" "$old_leaf" "$active_group" "$transaction"; then
+            retained=true
         else
-            rm -f "$CLASH_VPNGATE_API_RAW"
+            stage_ok=false
         fi
-        _merge_config_restart >/dev/null 2>&1 || true
-        _vpngate_restore_selections "$old_direct" "$old_front" >/dev/null 2>&1 || true
-        [[ "$old_route_type" == *Selector* ]] &&
-            _vpngate_restore_route_mode "$old_route_mode" "$old_route_type" >/dev/null 2>&1 || true
+    fi
+    if [ "$stage_ok" = true ]; then
+        reload_attempted=true
+        _merge_config_reload || stage_ok=false
+    fi
+    if [ "$stage_ok" != true ]; then
+        if _vpngate_update_rollback "$transaction" "$old_direct" "$old_front" \
+            "$old_route_mode" "$old_route_type" "$reload_attempted"; then
+            failure_reason='新节点配置加载失败，已保留更新前配置'
+        else
+            failure_reason='新节点配置加载失败，回滚也失败，请检查 Mihomo 状态'
+        fi
         rm -rf "$transaction"
         _vpngate_state_set last-update-result failed
-        _vpngate_state_set last-update-error "新节点配置加载失败，已回滚"
-        _errorcat "VPNGate 新节点配置加载失败，已恢复更新前配置"
+        _vpngate_state_set last-update-error "$failure_reason"
+        _errorcat "$failure_reason"
+        return 1
+    fi
+
+    stage_direct=$old_direct stage_front=$old_front
+    if [ "$retained" = true ]; then
+        case "$active_group" in
+        "$VPNGATE_GROUP_DIRECT") stage_direct=$old_leaf ;;
+        "$VPNGATE_GROUP_FRONT") stage_front=$old_leaf ;;
+        esac
+    fi
+    _vpngate_restore_selections "$stage_direct" "$stage_front" || true
+    _vpngate_restore_route_mode "$old_route_mode" "$old_route_type" ||
+        _failcat '⚠️' "未能恢复 VPNGate 更新前的出口模式，当前使用智能自动" || true
+    if ! _vpngate_handoff_after_reload "$active_group" "$auto_group" "$old_leaf" \
+        "$retained" "$old_route_mode"; then
+        failure_reason=${VPNGATE_HANDOFF_ERROR:-新候选或真实出口未通过检测}
+        if _vpngate_update_rollback "$transaction" "$old_direct" "$old_front" \
+            "$old_route_mode" "$old_route_type"; then
+            failure_reason+='；已保留更新前配置'
+        else
+            failure_reason+='；回滚也失败，请检查 Mihomo 状态'
+        fi
+        rm -rf "$transaction"
+        _vpngate_state_set last-update-result failed
+        _vpngate_state_set last-update-error "$failure_reason"
+        _errorcat "$failure_reason"
         return 1
     fi
 
     rm -rf "$transaction"
-    _vpngate_restore_selections "$old_direct" "$old_front" || true
-    _vpngate_restore_route_mode "$old_route_mode" "$old_route_type" ||
-        _failcat '⚠️' "未能恢复 VPNGate 更新前的出口模式，当前使用智能自动" || true
     _vpngate_state_set front-group "$VPNGATE_FRONT"
     _vpngate_state_set country "$VPNGATE_COUNTRY"
     _vpngate_state_set_num limit "$VPNGATE_LIMIT"
     _vpngate_state_set_num node-count "$VPNGATE_GENERATED_COUNT"
     _vpngate_state_set updated-at "$now"
-    _vpngate_state_set last-update-result changed
+    if [ "$VPNGATE_HANDOFF_SELECTION" = pinned ]; then
+        _vpngate_state_set last-update-result changed-pinned
+    else
+        _vpngate_state_set last-update-result changed
+    fi
     _vpngate_state_set last-update-error ""
     _vpngate_state_set last-apply-method "${CLASHCTL_CONFIG_APPLY_METHOD:-restart}"
-    printf '%s 加载成功 method=%s nodes=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" \
-        "${CLASHCTL_CONFIG_APPLY_METHOD:-restart}" "$VPNGATE_GENERATED_COUNT" >>"$CLASH_VPNGATE_LOG"
-    _okcat '✅' "VPNGate 节点已更新：$VPNGATE_GENERATED_COUNT（${CLASHCTL_CONFIG_APPLY_METHOD:-restart}）"
+    printf '%s 加载成功 method=%s nodes=%s handoff=%s retained=%s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${CLASHCTL_CONFIG_APPLY_METHOD:-restart}" \
+        "$VPNGATE_GENERATED_COUNT" "$VPNGATE_HANDOFF_SELECTION" "$retained" >>"$CLASH_VPNGATE_LOG"
+    [ "$retained" != true ] ||
+        _okcat 'ℹ️' '旧出口代理暂留在手选组中，下一次节点列表变更时清理'
+    [ "$VPNGATE_HANDOFF_SELECTION" != pinned ] ||
+        _failcat '⚠️' 'AUTO 实际出口未通过检测，已固定到测通的新节点/链路；稍后可手动切回 AUTO' || true
+    _okcat '✅' "VPNGate 节点已更新并验证出口：$VPNGATE_GENERATED_COUNT（${CLASHCTL_CONFIG_APPLY_METHOD:-restart}）"
 }
 
 _vpngate_off_locked() {
