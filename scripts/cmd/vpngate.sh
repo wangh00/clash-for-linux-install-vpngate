@@ -28,7 +28,7 @@ clashvpngate() {
         _vpngate_route "$@"
         ;;
     test)
-        clashnode delay -t "${CLASHCTL_VPNGATE_TEST_TIMEOUT:-20000}" -g "$VPNGATE_GROUP_AUTO"
+        _vpngate_test_current_route
         ;;
     schedule)
         shift
@@ -56,6 +56,40 @@ clashvpngate() {
         vpngate_help
         return 1
         ;;
+    esac
+}
+
+# 只验证实际选中的出口链路。对顶层嵌套 Selector/Fallback 调用 /group/delay
+# 会同时探测多个模式，并不能代表当前出口，还可能触发额外 OpenVPN 握手。
+_vpngate_test_current_route() {
+    local url=${CLASHCTL_VPNGATE_DELAY_URL:-https://cp.cloudflare.com}
+    local timeout_ms=${CLASHCTL_VPNGATE_TEST_TIMEOUT:-20000}
+    local max_time leaf result code duration
+    _node_validate_delay_url "$url" || return 1
+    _node_validate_delay_timeout "$timeout_ms" || return 1
+    service_is_active >/dev/null 2>&1 || {
+        _failcat 'Mihomo 未运行，无法测试 VPNGate 出口'
+        return 1
+    }
+    leaf=$(_vpngate_route_leaf)
+    [ -n "$leaf" ] || {
+        _failcat '无法读取当前 VPNGate 出口节点'
+        return 1
+    }
+    _vpngate_local_proxy_args
+    max_time=$(((timeout_ms + 999) / 1000 + 5))
+    _okcat '🌐' "通过本机代理端口测试当前出口 [$leaf]..."
+    result=$(curl --silent --show-error --location --noproxy '' \
+        "${VPNGATE_CURL_PROXY[@]}" --max-time "$max_time" \
+        --output /dev/null --write-out $'%{http_code}\t%{time_total}' "$url") || {
+        _failcat "当前 VPNGate 出口不可连接：$leaf"
+        return 1
+    }
+    code=${result%%$'\t'*}
+    duration=${result#*$'\t'}
+    case "$code" in
+    2?? | 3??) _okcat '✅' "当前出口可连接：$leaf（HTTP $code，${duration}s）" ;;
+    *) _failcat "当前 VPNGate 出口测速失败：HTTP $code（$leaf）"; return 1 ;;
     esac
 }
 
@@ -662,7 +696,7 @@ _vpngate_diagnose() {
 
     if [ -n "$leaf" ]; then
         line=$(_node_delay_one "$leaf" \
-            "timeout=8000&url=$(_node_urlencode "${CLASHCTL_VPNGATE_DELAY_URL:-https://cp.cloudflare.com}")" 2>/dev/null)
+            "timeout=8000&url=$(_node_urlencode "${CLASHCTL_VPNGATE_DELAY_URL:-https://cp.cloudflare.com}")" 8000 2>/dev/null)
         delay=${line#*$'\t'}
         if [[ "$delay" =~ ^[1-9][0-9]*$ ]]; then
             _vpngate_diag_print OK '当前出口连通性' "${delay}ms"
@@ -687,7 +721,7 @@ Usage:
   clashctl vpngate on [OPTIONS]               开启 TUN、获取节点并启用自动出口
   clashctl vpngate update [OPTIONS]           更新并重新加载节点
   clashctl vpngate off                        关闭 VPNGate 模式
-  clashctl vpngate test                       测试 VPNGate-AUTO 策略组
+  clashctl vpngate test                       通过本机代理端口测试当前 VPNGate 出口
   clashctl vpngate status                     查看状态
   clashctl vpngate schedule status            查看定时更新状态
   clashctl vpngate schedule start [分钟]      启动定时更新（仅 VPNGate 启用期间）

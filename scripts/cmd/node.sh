@@ -856,11 +856,51 @@ _node_delay_primary() {
 }
 
 _node_delay_one() {
-    local name=$1 qs=$2 enc resp delay
+    local name=$1 qs=$2 timeout=${3:-5000} enc resp delay api_timeout
     enc=$(_node_urlencode "$name")
-    resp=$(_node_curl GET "/proxies/$enc/delay?$qs")
-    delay=$("$BIN_YQ" -p json '.delay // ""' <<<"$resp" 2>/dev/null)
+    api_timeout=$(_node_delay_api_timeout "$timeout")
+    resp=$(CLASHCTL_API_TIMEOUT="$api_timeout" _node_curl GET "/proxies/$enc/delay?$qs") || resp=''
+    delay=$("$BIN_YQ" -p json '.delay // ""' <<<"$resp" 2>/dev/null) || delay=''
     printf '%s\t%s\n' "$name" "$delay"
+}
+
+_node_delay_api_timeout() {
+    local timeout_ms=$1 api_timeout=${CLASHCTL_API_TIMEOUT:-10} minimum
+    [[ "$timeout_ms" =~ ^[0-9]+$ ]] || timeout_ms=5000
+    [[ "$api_timeout" =~ ^[0-9]+$ ]] || api_timeout=10
+    minimum=$(((timeout_ms + 999) / 1000 + 5))
+    ((api_timeout > minimum)) && minimum=$api_timeout
+    printf '%s\n' "$minimum"
+}
+
+_node_is_vpngate_visible_group() {
+    case "$1" in
+    VPNGate-直连 | VPNGate-经前置) return 0 ;;
+    *) return 1 ;;
+    esac
+}
+
+# VPNGate 的“全体测速”不能调用 /group/:name/delay：该接口会同时测试组内
+# 全部 OpenVPN 节点，容易让前置链和自动健康检查一起拥塞。跳过 AUTO 组，
+# 只把叶子节点按小并发分批测试。
+_node_vpngate_member_rows() {
+    local group=$1 url=$2 timeout=$3 name prefix concurrency
+    shift 3
+    case "$group" in
+    VPNGate-直连) prefix='[直连] VPNGate-' ;;
+    VPNGate-经前置) prefix='[前置] VPNGate-' ;;
+    *) return 1 ;;
+    esac
+    local members=()
+    for name in "$@"; do
+        [[ "$name" == "$prefix"* ]] && members+=("$name")
+    done
+    [ ${#members[@]} -gt 0 ] || return 1
+    concurrency=${CLASHCTL_VPNGATE_DELAY_CONCURRENCY:-3}
+    [[ "$concurrency" =~ ^[1-9][0-9]*$ ]] || concurrency=3
+    ((concurrency > 5)) && concurrency=5
+    CLASHCTL_NODE_DELAY_CONCURRENCY="$concurrency" \
+        _node_delay_member_rows "$url" "$timeout" "${members[@]}"
 }
 
 _node_delay_member_rows() {
@@ -875,7 +915,7 @@ _node_delay_member_rows() {
 
     {
         for name in "${members[@]}"; do
-            _node_delay_one "$name" "$qs" &
+            _node_delay_one "$name" "$qs" "$timeout" &
             ((active += 1))
             if ((active >= concurrency)); then
                 wait
@@ -890,10 +930,16 @@ _node_delay_rows() {
     local group=$1 url=$2 timeout=$3
     shift 3
     local members=("$@")
-    local enc qs resp code body name delay
+    local enc qs resp code body name delay api_timeout
+    if _node_is_vpngate_visible_group "$group"; then
+        _node_vpngate_member_rows "$group" "$url" "$timeout" "${members[@]}"
+        return
+    fi
     enc=$(_node_urlencode "$group")
     qs="timeout=${timeout}&url=$(_node_urlencode "$url")"
-    resp=$(_node_curl GET "/group/$enc/delay?$qs" -w $'\n%{http_code}')
+    api_timeout=$(_node_delay_api_timeout "$timeout")
+    resp=$(CLASHCTL_API_TIMEOUT="$api_timeout" \
+        _node_curl GET "/group/$enc/delay?$qs" -w $'\n%{http_code}')
     code=${resp##*$'\n'}
     body=${resp%$'\n'*}
 
@@ -930,12 +976,32 @@ _node_delay_fallback() {
 
 _node_delay_group() {
     local group=$1 url=$2 timeout=$3
-    local enc qs resp code body
+    local enc qs resp code body api_timeout name
+    if _node_is_vpngate_visible_group "$group"; then
+        local members=()
+        while IFS= read -r name; do
+            [ -n "$name" ] && members+=("$name")
+        done < <(_node_members "$group")
+        [ ${#members[@]} -gt 0 ] || {
+            _failcat "策略组 [$group] 无节点或不存在"
+            return 1
+        }
+        _okcat "正在分批测速 [$group]：小并发逐节点检测，完整测试可能需数分钟..."
+        local rows
+        rows=$(_node_vpngate_member_rows "$group" "$url" "$timeout" "${members[@]}") || {
+            _failcat "策略组 [$group] 没有可测速的 VPNGate 叶子节点"
+            return 1
+        }
+        printf '%s\n' "$rows" | _node_print_delays
+        return
+    fi
     enc=$(_node_urlencode "$group")
     qs="timeout=${timeout}&url=$(_node_urlencode "$url")"
 
     _okcat "正在测速策略组 [$group]（可能需要数秒）..."
-    resp=$(_node_curl GET "/group/$enc/delay?$qs" -w $'\n%{http_code}')
+    api_timeout=$(_node_delay_api_timeout "$timeout")
+    resp=$(CLASHCTL_API_TIMEOUT="$api_timeout" \
+        _node_curl GET "/group/$enc/delay?$qs" -w $'\n%{http_code}')
     code=${resp##*$'\n'}
     body=${resp%$'\n'*}
 
@@ -986,7 +1052,8 @@ Examples:
 可选环境变量（.env）：
   CLASHCTL_NODE_DELAY_URL      测速目标 URL（默认 http://www.gstatic.com/generate_204）
   CLASHCTL_NODE_DELAY_TIMEOUT  单节点超时毫秒（默认 5000）
-  CLASHCTL_NODE_DELAY_CONCURRENCY  旧内核 fallback 并发数（默认 8）
+  CLASHCTL_NODE_DELAY_CONCURRENCY  普通组旧内核 fallback 并发数（默认 8）
+  CLASHCTL_VPNGATE_DELAY_CONCURRENCY  VPNGate 全体测速并发数（默认 3，最多 5）
 
 EOF
         return 0

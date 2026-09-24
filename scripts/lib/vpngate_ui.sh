@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 
 # VPNGate 节点已经写入 Mihomo 顶层，原生单测与选择均可用。为避免 Zashboard
-# 的“全体测速”同时发出约 87 个独立请求，在捕获阶段接管两个可见组的标题
-# 测速按钮，改用 Mihomo 原生 /group/:name/delay；节点卡片主体仍由
+# 的“全体测速”同时发出全部独立请求，在捕获阶段接管两个可见组的标题
+# 测速按钮，改用最多 3 路并发的单节点测速；节点卡片主体仍由
 # Zashboard 处理以手动选择，节点延迟按钮改用 Cloudflare 目标做原生单测。
 # 补丁带静态和浏览器运行时双重兼容性自检；Zashboard 更新导致 DOM 结构变化
 # 时会明确提示，而不是静默失效。
@@ -17,7 +17,7 @@ _vpngate_patch_zashboard() {
 
     cat >"$script" <<'JS'
 ;(() => {
-  const patchVersion = '2026.09.04.1'
+  const patchVersion = '2026.09.24.1'
   const checkStorageKey = 'clashctl/vpngate-ui-check'
   const routeSelector = 'VPNGate-AUTO'
   const smartAuto = 'VPNGate-\u667a\u80fd\u81ea\u52a8'
@@ -25,6 +25,7 @@ _vpngate_patch_zashboard() {
     ['VPNGate-\u76f4\u8fde', 15000],
     ['VPNGate-\u7ecf\u524d\u7f6e', 20000],
   ])
+  const groupConcurrency = 3
   let running = false
   let routeState = null
   let lastProxies = null
@@ -111,7 +112,9 @@ _vpngate_patch_zashboard() {
         return
       }
       tag.dataset.vpngateDelay = value
-      tag.dataset.vpngateDelayTitle = value === '…' ? 'VPNGate 节点测速中' : `VPNGate 延迟 ${value} ms`
+      tag.dataset.vpngateDelayTitle = value === '…'
+        ? 'VPNGate 节点测速中'
+        : value === 'timeout' ? 'VPNGate 节点测速超时或失败' : `VPNGate 延迟 ${value} ms`
       tag.title = tag.dataset.vpngateDelayTitle
     })
   }
@@ -125,6 +128,57 @@ _vpngate_patch_zashboard() {
     if (previous === undefined) latencyResults.delete(node)
     else latencyResults.set(node, previous)
     renderLatencyResults()
+  }
+
+  const probeDelay = async (api, node, timeout) => {
+    const params = new URLSearchParams({url: 'https://cp.cloudflare.com', timeout: String(timeout)})
+    const headers = api.password ? {Authorization: `Bearer ${api.password}`} : {}
+    const abort = new AbortController()
+    const timer = setTimeout(() => abort.abort(), timeout + 5000)
+    try {
+      const response = await fetch(
+        `${api.base}/proxies/${encodeURIComponent(node)}/delay?${params}`,
+        {headers, signal: abort.signal},
+      )
+      const data = await response.json().catch(() => ({}))
+      if (!response.ok) throw new Error(data.message || `HTTP ${response.status}`)
+      const delay = Number(data.delay)
+      if (!Number.isFinite(delay) || delay <= 0) throw new Error('未返回有效延迟')
+      return delay
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  const probeGroupBatched = async (api, group, timeout) => {
+    const headers = api.password ? {Authorization: `Bearer ${api.password}`} : {}
+    const response = await fetch(`${api.base}/proxies/${encodeURIComponent(group)}`, {headers})
+    if (!response.ok) throw new Error(`读取策略组失败：HTTP ${response.status}`)
+    const detail = await response.json()
+    const prefix = group === 'VPNGate-\u76f4\u8fde' ? '[直连] VPNGate-' : '[前置] VPNGate-'
+    const members = (detail.all || []).filter((name) => name.startsWith(prefix))
+    if (!members.length) throw new Error('策略组没有 VPNGate 节点')
+
+    let next = 0
+    let completed = 0
+    let success = 0
+    const worker = async () => {
+      while (next < members.length) {
+        const node = members[next++]
+        setLatencyResult(node, '…')
+        try {
+          const delay = await probeDelay(api, node, timeout)
+          setLatencyResult(node, delay)
+          success += 1
+        } catch {
+          setLatencyResult(node, 'timeout')
+        }
+        completed += 1
+        toast(`${group} 分批测速 ${completed}/${members.length}，可连接 ${success}`)
+      }
+    }
+    await Promise.all(Array.from({length: Math.min(groupConcurrency, members.length)}, worker))
+    return {total: members.length, success}
   }
 
   const saveCompatibility = (status, errors = [], detail = '') => {
@@ -403,7 +457,7 @@ _vpngate_patch_zashboard() {
       node?.startsWith('[前置] VPNGate-'))
     if (!isGroupTest && !isNodeTest) return
 
-    // 阻止 Zashboard 为全体测速同时发起约 87 个独立请求。
+    // 阻止 Zashboard 和 /group/:name/delay 同时测试全部 VPNGate 节点。
     event.preventDefault()
     event.stopPropagation()
     event.stopImmediatePropagation()
@@ -423,33 +477,16 @@ _vpngate_patch_zashboard() {
     const previousResult = isNodeTest ? latencyResults.get(node) : undefined
     if (isNodeTest) setLatencyResult(node, '…')
     toast(isGroupTest
-      ? `${group} 全体测速中，最长等待 ${timeout / 1000} 秒…`
+      ? `${group} 分批测速中：最多 ${groupConcurrency} 路并发，每节点最多 ${timeout / 1000} 秒…`
       : `${node} 单节点测速中，最长等待 ${timeout / 1000} 秒…`)
 
-    const abort = new AbortController()
-    const timer = setTimeout(() => abort.abort(), timeout + 5000)
     try {
-      // 与 Mihomo 的 VPNGate AUTO 健康检查保持一致，避免部分公共 VPN
-      // 屏蔽 Google 测速地址而产生假超时。
-      const testUrl = 'https://cp.cloudflare.com'
-      const params = new URLSearchParams({url: testUrl, timeout: String(timeout)})
-      const headers = api.password ? {Authorization: `Bearer ${api.password}`} : {}
-      const endpoint = isGroupTest
-        ? `group/${encodeURIComponent(group)}`
-        : `proxies/${encodeURIComponent(node)}`
-      const response = await fetch(
-        `${api.base}/${endpoint}/delay?${params}`,
-        {headers, signal: abort.signal},
-      )
-      const data = await response.json().catch(() => ({}))
-      if (!response.ok) throw new Error(data.message || `HTTP ${response.status}`)
       if (isGroupTest) {
-        const count = Object.values(data).filter((value) => Number.isFinite(value)).length
-        toast(`${group} 全体测速完成：${count} 个节点返回延迟。`)
+        const {total, success} = await probeGroupBatched(api, group, timeout)
+        toast(`${group} 分批测速完成：${success}/${total} 个节点可连接。`)
         setTimeout(() => location.reload(), 1200)
       } else {
-        const delay = Number(data.delay)
-        if (!Number.isFinite(delay) || delay <= 0) throw new Error('未返回有效延迟')
+        const delay = await probeDelay(api, node, timeout)
         setLatencyResult(node, delay)
         toast(`${node} 单节点测速完成：${delay} ms。`)
         setTimeout(() => {
@@ -461,7 +498,6 @@ _vpngate_patch_zashboard() {
       if (isNodeTest) restoreLatencyResult(node, previousResult)
       toast(`${isGroupTest ? group + ' 全体' : node + ' 单节点'}测速失败：${error.message || error}`, true)
     } finally {
-      clearTimeout(timer)
       running = false
     }
   }, true)
@@ -506,12 +542,14 @@ _vpngate_ui_static_check() {
 
     [ -s "$index" ] && [ -s "$script" ] || return 1
     grep -q 'id="vpngate-disable-single-test"' "$index" || return 1
-    grep -q "const patchVersion = '2026.09.04.1'" "$script" || return 1
+    grep -q "const patchVersion = '2026.09.24.1'" "$script" || return 1
     grep -q "checkStorageKey = 'clashctl/vpngate-ui-check'" "$script" || return 1
     grep -q "querySelectorAll('.collapse')" "$script" || return 1
     grep -q "'.latency-tag'" "$script" || return 1
     grep -q 'const isSelectorGroup' "$script" || return 1
     grep -q 'data-vpngate-delay' "$script" || return 1
+    grep -q 'const groupConcurrency = 3' "$script" || return 1
+    grep -q 'const probeGroupBatched' "$script" || return 1
 
     expected=$(sha256sum "$script" | awk '{print substr($1,1,12)}')
     actual=$(grep -oE 'vpngate-ui\.js\?v=[0-9a-f]+' "$index" | head -1 | cut -d= -f2)
@@ -538,7 +576,7 @@ _vpngate_ui_check() {
     fi
 
     if [ -s "$script" ]; then
-        printf '  [OK] 浏览器运行时自检已内置（版本 2026.09.04.1）\n'
+        printf '  [OK] 浏览器运行时自检已内置（版本 2026.09.24.1）\n'
         printf '       结果键：localStorage["clashctl/vpngate-ui-check"]\n'
     fi
 
