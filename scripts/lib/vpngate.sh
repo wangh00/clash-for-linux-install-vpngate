@@ -3,6 +3,7 @@
 VPNGATE_GROUP_DIRECT="VPNGate-直连"
 VPNGATE_GROUP_FRONT="VPNGate-经前置"
 VPNGATE_GROUP_AUTO="VPNGate-AUTO"
+VPNGATE_GROUP_DNS="VPNGate-DNS"
 VPNGATE_GROUP_SMART_AUTO="VPNGate-智能自动"
 VPNGATE_GROUP_DIRECT_AUTO="VPNGate-直连-AUTO"
 VPNGATE_GROUP_FRONT_AUTO="VPNGate-经前置-AUTO"
@@ -76,7 +77,7 @@ _vpngate_with_lock() {
 _vpngate_is_internal_group() {
     case "$1" in
     "$VPNGATE_GROUP_DIRECT" | "$VPNGATE_GROUP_FRONT" | "$VPNGATE_GROUP_AUTO" | \
-        "$VPNGATE_GROUP_SMART_AUTO" | \
+        "$VPNGATE_GROUP_SMART_AUTO" | "$VPNGATE_GROUP_DNS" | \
         "$VPNGATE_GROUP_DIRECT_AUTO" | "$VPNGATE_GROUP_FRONT_AUTO")
         return 0
         ;;
@@ -448,18 +449,63 @@ _vpngate_build_probe_names() {
     "$BIN_YQ" -e '.proxies | type == "!!seq" and length > 0' "$output" >/dev/null
 }
 
+# DNS 控制链路必须独立于当前 VPNGate：目标域名经固定前置 DoH 解析，
+# 前置服务器自身的域名用独立直连 DoH 引导。禁用继承的 #RULES/policy，
+# 避免坏出口 -> DNS 失败 -> 所有候选假超时的循环。仅写入 VPNGate Overlay。
+_vpngate_dns_config() {
+    GROUP_DNS="$VPNGATE_GROUP_DNS" "$BIN_YQ" -n -o=json -I=0 '
+      {
+        "enable": true,
+        "respect-rules": false,
+        "prefer-h3": false,
+        "default-nameserver": ["223.5.5.5", "119.29.29.29"],
+        "proxy-server-nameserver": [
+          "https://223.5.5.5/dns-query#DIRECT",
+          "https://1.12.12.12/dns-query#DIRECT"
+        ],
+        "proxy-server-nameserver-policy": null,
+        "nameserver": [
+          "https://1.1.1.1/dns-query#" + strenv(GROUP_DNS),
+          "https://8.8.8.8/dns-query#" + strenv(GROUP_DNS)
+        ],
+        "nameserver-policy": null,
+        "fallback": [],
+        "direct-nameserver": [
+          "https://223.5.5.5/dns-query#DIRECT",
+          "https://1.12.12.12/dns-query#DIRECT"
+        ],
+        "direct-nameserver-follow-policy": false
+      }
+    '
+}
+
+_vpngate_dns_guard_matches() {
+    local front=$1 expected actual
+    expected=$(_vpngate_dns_config) || return 1
+    actual=$("$BIN_YQ" -o=json -I=0 '.dns // {}' "$CLASH_VPNGATE_OVERLAY" 2>/dev/null) || return 1
+    [ "$actual" = "$expected" ] || return 1
+    GROUP_DNS="$VPNGATE_GROUP_DNS" FRONT_GROUP="$front" "$BIN_YQ" -e '
+      .proxy-groups.append[] | select(.name == strenv(GROUP_DNS)) |
+      select((.proxies | length) == 1) | select(.proxies[0] == strenv(FRONT_GROUP))
+    ' "$CLASH_VPNGATE_OVERLAY" >/dev/null 2>&1
+}
+
 _vpngate_write_overlay() {
     local mode=$1 front=$2
-    local tmp="${CLASH_VPNGATE_OVERLAY}.tmp"
+    local tmp="${CLASH_VPNGATE_OVERLAY}.tmp" dns_config
     local health_url=${CLASHCTL_VPNGATE_DELAY_URL:-https://cp.cloudflare.com}
 
     if [ "$mode" = off ]; then
         printf '{}\n' >"$tmp"
     elif [ "$mode" = bootstrap ]; then
-        FRONT_GROUP=$front "$BIN_YQ" -n '
+        FRONT_GROUP=$front GROUP_DNS="$VPNGATE_GROUP_DNS" "$BIN_YQ" -n '
           {
             "tun": {"enable": true},
-            "rules": {"prepend": ["DOMAIN,www.vpngate.net," + strenv(FRONT_GROUP)]}
+            "rules": {"prepend": ["DOMAIN,www.vpngate.net," + strenv(FRONT_GROUP)]},
+            "proxy-groups": {"append": [{
+              "name": strenv(GROUP_DNS), "type": "select", "hidden": true,
+              "proxies": [strenv(FRONT_GROUP)]
+            }]}
           }
         ' >"$tmp"
     else
@@ -485,7 +531,7 @@ _vpngate_write_overlay() {
             DIRECT_PROBE_FILE="$direct_probe" FRONT_PROBE_FILE="$front_probe" \
             FRONT_GROUP="$front" HEALTH_URL="$health_url" \
             GROUP_DIRECT=$VPNGATE_GROUP_DIRECT GROUP_FRONT=$VPNGATE_GROUP_FRONT GROUP_AUTO=$VPNGATE_GROUP_AUTO \
-            GROUP_SMART_AUTO=$VPNGATE_GROUP_SMART_AUTO \
+            GROUP_SMART_AUTO=$VPNGATE_GROUP_SMART_AUTO GROUP_DNS=$VPNGATE_GROUP_DNS \
             GROUP_DIRECT_AUTO=$VPNGATE_GROUP_DIRECT_AUTO GROUP_FRONT_AUTO=$VPNGATE_GROUP_FRONT_AUTO \
             "$BIN_YQ" -n '
               (load(strenv(DIRECT_FILE)).proxies // []) as $direct |
@@ -505,6 +551,10 @@ _vpngate_write_overlay() {
                 },
                 "proxy-groups": {
                   "append": [
+                    {
+                      "name": strenv(GROUP_DNS), "type": "select", "hidden": true,
+                      "proxies": [strenv(FRONT_GROUP)]
+                    },
                     {
                       "name": strenv(GROUP_DIRECT_AUTO), "type": "url-test",
                       "proxies": $directProbeNames, "url": strenv(HEALTH_URL),
@@ -545,6 +595,11 @@ _vpngate_write_overlay() {
             return 1
         fi
         rm -rf "$static_dir"
+    fi
+
+    if [ "$mode" != off ]; then
+        dns_config=$(_vpngate_dns_config) || return 1
+        DNS_CONFIG="$dns_config" "$BIN_YQ" -i '.dns = (strenv(DNS_CONFIG) | from_json)' "$tmp" || return 1
     fi
 
     "$BIN_YQ" -e '.' "$tmp" >/dev/null || {

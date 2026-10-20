@@ -69,10 +69,13 @@ reset_case() {
     PROBE_OK=true
     WRITE_OK=true
     VERIFY_MODE=auto
+    NODES_CHANGED=true
+    DNS_GUARD_OK=true
 }
 _vpngate_init_files() { :; }
 _vpngate_resolve_options() { VPNGATE_FRONT=FRONT; VPNGATE_COUNTRY=''; VPNGATE_LIMIT=0; }
 _vpngate_front_exists() { :; }
+_vpngate_dns_guard_matches() { [ "$DNS_GUARD_OK" = true ]; }
 tunstatus() { :; }
 _vpngate_state_get() { printf '%s\n' "${STATE[$1]:-}"; }
 _vpngate_state_set() { STATE[$1]=$2; }
@@ -91,6 +94,11 @@ _node_members() {
     esac
 }
 _vpngate_sync_nodes() {
+    if [ "$NODES_CHANGED" != true ]; then
+        VPNGATE_NODES_CHANGED=false
+        VPNGATE_GENERATED_COUNT=1
+        return 0
+    fi
     printf 'new\n' >"$CLASH_VPNGATE_NODES_DIRECT"
     printf 'new\n' >"$CLASH_VPNGATE_NODES_FRONT"
     printf 'new\n' >"$CLASH_VPNGATE_API_RAW"
@@ -151,5 +159,21 @@ fi
 [ "$RELOADS" -eq 0 ]
 [ "$(cat "$CLASH_VPNGATE_NODES_FRONT")" = old ]
 cmp -s "$TMP/old-template.yaml" "$CLASH_VPNGATE_OVERLAY"
+
+# 老 Overlay 未带 DNS 隔离时，即使 API 节点未变也必须迁移并验证出口。
+reset_case
+NODES_CHANGED=false
+DNS_GUARD_OK=false
+_vpngate_update_locked
+[ "$RELOADS" -eq 1 ]
+[ "${STATE[last-update-result]}" = changed ]
+[ "${SELECTED[$VPNGATE_GROUP_FRONT]}" = "$VPNGATE_GROUP_FRONT_AUTO" ]
+
+# 新 Overlay 已生效且节点未变时不重复热加载。
+reset_case
+NODES_CHANGED=false
+_vpngate_update_locked
+[ "$RELOADS" -eq 0 ]
+[ "${STATE[last-update-result]}" = unchanged ]
 
 echo 'vpngate update transaction tests: ok'

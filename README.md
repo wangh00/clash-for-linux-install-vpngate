@@ -258,6 +258,15 @@ VPNGate 组的“全体测速”会按最多 3 路并发逐节点测试，避免
 命令行 `clashctl vpngate test` 会通过本机代理端口验证当前真实出口，不会
 同时测试顶层嵌套策略组。
 
+VPNGate 开启期间，Overlay 会把普通 DNS 查询固定经前置订阅发送到加密 DoH，
+前置节点自身的域名则通过独立直连 DoH 引导，避免失效 VPNGate 把 DNS 和候选
+测速一起拖死。此时会暂时覆盖订阅的 DNS 上游、分域策略和 fallback；保留
+fake-ip、监听地址等设置，关闭 VPNGate 后恢复原订阅/Mixin 的 DNS 配置。
+候选恢复探测默认使用不依赖 DNS 的 `https://1.1.1.1/cdn-cgi/trace`（可通过
+`CLASHCTL_VPNGATE_RECOVERY_URL` 修改），切换后仍使用
+`CLASHCTL_VPNGATE_DELAY_URL` 验证实际域名访问。前置不可用时，此 DNS 链路也
+可能不可用；配置回滚仅保留旧配置，不保证旧公共节点仍然在线。
+
 前置订阅节点仍然在原来的订阅策略组中切换；VPNGate 直连/经前置模式则在
 上述两个 VPNGate 组中切换，两者不要混淆。
 

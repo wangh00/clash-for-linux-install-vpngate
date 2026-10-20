@@ -330,10 +330,12 @@ _vpngate_overlay_retain_proxy() {
 }
 
 # 只探测隐藏 AUTO 组中排名靠前的少量新候选，分批最多 3 路并发。
+# 恢复探测默认使用带有效 TLS 证书的 IP 目标，不依赖当前出口的 DNS；
+# 真正切换后仍用用户配置的域名 URL 验证实际出口，不把 IP 探测当作恢复完成。
 # stdout 仅返回第一批中延迟最低的可用节点名；日志由调用方记录。
 _vpngate_probe_auto_candidates() {
     local auto_group=$1 prefix timeout_ms name delay result candidate best best_delay
-    local url=${CLASHCTL_VPNGATE_DELAY_URL:-https://cp.cloudflare.com}
+    local url=${CLASHCTL_VPNGATE_RECOVERY_URL:-https://1.1.1.1/cdn-cgi/trace}
     local limit=${CLASHCTL_VPNGATE_UPDATE_PROBE_LIMIT:-6}
     local concurrency=${CLASHCTL_VPNGATE_UPDATE_PROBE_CONCURRENCY:-3}
     local i j
@@ -517,7 +519,8 @@ _vpngate_update_locked() {
 
     # 节点完整签名没有变化时只记录检查时间，不重载 Mihomo，也不会打断
     # 当前 OpenVPN 会话或用户在 9090 中固定的节点。
-    if [ "$VPNGATE_NODES_CHANGED" != true ]; then
+    # 旧安装缺少 DNS 隔离时，即使节点列表未变化也必须热加载迁移。
+    if [ "$VPNGATE_NODES_CHANGED" != true ] && _vpngate_dns_guard_matches "$VPNGATE_FRONT"; then
         rm -rf "$transaction"
         _vpngate_state_set front-group "$VPNGATE_FRONT"
         _vpngate_state_set country "$VPNGATE_COUNTRY"

@@ -63,6 +63,7 @@ _node_members() {
 }
 _node_delay_member_rows() {
     local name
+    printf '%s\n' "$1" >>"$TMP/probe-urls"
     shift 2
     printf '%s\n' "$#" >>"$TMP/batch-sizes"
     [ "${CLASHCTL_NODE_DELAY_CONCURRENCY:-}" = 3 ]
@@ -76,6 +77,12 @@ _node_delay_member_rows() {
 candidate=$(_vpngate_probe_auto_candidates "$VPNGATE_GROUP_FRONT_AUTO")
 [ "$candidate" = '[前置] VPNGate-new-4' ]
 [ "$(cat "$TMP/batch-sizes")" = $'3\n3' ]
+[ "$(sort -u "$TMP/probe-urls")" = 'https://1.1.1.1/cdn-cgi/trace' ]
+rm "$TMP/probe-urls"
+candidate=$(CLASHCTL_VPNGATE_RECOVERY_URL=https://1.0.0.1/cdn-cgi/trace \
+    _vpngate_probe_auto_candidates "$VPNGATE_GROUP_FRONT_AUTO")
+[ "$candidate" = '[前置] VPNGate-new-4' ]
+[ "$(sort -u "$TMP/probe-urls")" = 'https://1.0.0.1/cdn-cgi/trace' ]
 
 _node_now() { printf '%s\n' '[前置] VPNGate-old'; }
 _node_apply() { printf '%s|%s\n' "$1" "$2" >>"$TMP/applied"; }
